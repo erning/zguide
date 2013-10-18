@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>关于字符串</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch01.html" title="Chapter 1. ØMQ基础" /><link rel="prev" href="ch01s04.html" title="提问-回答" /><link rel="next" href="ch01s06.html" title="获取版本号" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">关于字符串</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch01s04.html">Prev</a> </td><th width="60%" align="center">Chapter 1. ØMQ基础</th><td width="20%" align="right"> <a accesskey="n" href="ch01s06.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="关于字符串"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp18961896"></a>关于字符串</h2></div></div></div><p>ØMQ不会关心发送消息的内容，只要知道它所包含的字节数。所以，程序员需要做一些工作，保证对方节点能够正确读取这些消息。如何将一个对象或复杂数据类型转换成ZMQ可以发送的消息，这有类似Protocol Buffers的序列化软件可以做到。但对于字符串，你也是需要有所注意的。</p><p>在C语言中，字符串都以一个空字符结尾，你可以像这样发送一个完整的字符串：</p><pre class="programlisting">
+zmq_send (requester, "Hello", 6, 0);
+</pre><p>但是，如果你用其他语言发送这个字符串，很可能不会包含这个空字节，如你使用Python发送：</p><pre class="programlisting">
+socket.send ("Hello")
+</pre><p>实际发送的消息是<a class="xref" href="ch01s05.html#figure-3" title="Figure 1.2. A ØMQ string">Figure 1.2, “A ØMQ string”</a>：</p><div class="figure"><a id="figure-3"></a><p class="title"><strong>Figure 1.2. A ØMQ string</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig3.png" alt="A ØMQ string" /></div></div></div><br class="figure-break" /><p>如果你从C语言中读取该消息，你会读到一个类似于字符串的内容，甚至它可能就是一个字符串（第六位在内存中正好是一个空字符），但是这并不合适。这样一来，客户端和服务端对字符串的定义就不统一了，你会得到一些奇怪的结果。</p><p>当你用C语言从ØMQ中获取字符串，你不能够相信该字符串有一个正确的结尾。因此，当你在接受字符串时，应该建立多一个字节的缓冲区，将字符串放进去，并添加结尾。</p><p>所以，让我们做如下假设：<span class="bold"><strong>ØMQ的字符串是有长度的，且传送时<span class="emphasis"><em>不加</em></span>结束符</strong></span>。在最简单的情况下，ØMQ字符串和ØMQ消息中的一帧是等价的，就如上图所展现的，由一个长度属性和一串字节表示。</p><p>下面这个功能函数会帮助我们在C语言中正确的接受字符串消息：</p><pre class="programlisting">
+//  Receive 0MQ string from socket and convert into C string
+//  Chops string at 255 chars, if it's longer
+static char *
+s_recv (void *socket) {
+    char buffer [256];
+    int size = zmq_recv (socket, buffer, 255, 0);
+    if (size == -1)
+        return NULL;
+    if (size &gt; 255)
+        size = 255;
+    buffer [size] = 0;
+    return strdup (buffer);
+}
+</pre><p>这段代码我们会在日后的示例中使用，我们可以顺手写一个<code class="literal">s_send()</code>方法，并打包成一个.h文件供我们使用。</p><p>这就诞生了zhelpers.h，一个供C语言使用的ØMQ功能函数库。它的源代码比较长，而且只对C语言程序员有用，你可以在闲暇时<a class="ulink" href="https://github.com/imatix/zguide/blob/master/examples/C/zhelpers.h" target="_top">看一看</a>。</p></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch01s04.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch01.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch01s06.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">提问-回答 </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> 获取版本号</td></tr></table></div></body></html>

@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Large-Scale File Publishing: FileMQ</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch07.html" title="Chapter 7. Advanced Architecture using ØMQ" /><link rel="prev" href="ch07s06.html" title="Authentication Using SASL" /><link rel="next" href="ch07s08.html" title="Getting an Official Port Number" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Large-Scale File Publishing: FileMQ</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch07s06.html">Prev</a> </td><th width="60%" align="center">Chapter 7. Advanced Architecture using ØMQ</th><td width="20%" align="right"> <a accesskey="n" href="ch07s08.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Large-Scale File Publishing: FileMQ"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp21044392"></a>Large-Scale File Publishing: FileMQ</h2></div></div></div><p>Let's put all these techniques together into a file distribution system that I'll call FileMQ. This is going to be a real product, living on <a class="ulink" href="https://github.com/zeromq/filemq" target="_top">GitHub</a>. What we'll make here is a first version of FileMQ, as a training tool. If the concept works, the real thing may eventually get its own book.</p><div class="sect2" title="Why make FileMQ?"><div class="titlepage"><div><div><h3 class="title"><a id="idp21045600"></a>Why make FileMQ?</h3></div></div></div><p>Why make a file distribution system? I already explained how to send large files over ØMQ, and it's really quite simple. But if you want to make messaging accessible to a million times more people than can use ØMQ, you need another kind of API. An API that my five-year old son can understand. An API that is universal, requires no programming, and works with just about every single application.</p><p>Yes, I'm talking about the file system. It's the DropBox pattern: chuck your files somewhere and they get magically copied somewhere else when the network connects again.</p><p>However, what I'm aiming for is a fully decentralized architecture that looks more like git, that doesn't need any cloud services (though we could put FileMQ in the cloud), and that does multicast, i.e., can send files to many places at once.</p><p>FileMQ must be secure(able), easily hooked into random scripting languages, and as fast as possible across our domestic and office networks.</p><p>I want to use it to back up photos from my mobile phone to my laptop over WiFi. To share presentation slides in real time across 50 laptops in a conference. To share documents with colleagues in a meeting. To send earthquake data from sensors to central clusters. To back up video from my phone as I take it, during protests or riots. To synchronize configuration files across a cloud of Linux servers.</p><p>A visionary idea, isn't it? Well, ideas are cheap. The hard part is making this, and making it simple.</p></div><div class="sect2" title="Initial Design Cut: the API"><div class="titlepage"><div><div><h3 class="title"><a id="idp21048672"></a>Initial Design Cut: the API</h3></div></div></div><p>Here's the way I see the first design. FileMQ has to be distributed, which means that every node can be a server and a client at the same time. But I don't want the protocol to be symmetrical, because that seems forced. We have a natural flow of files from point A to point B, where A is the "server" and B is the "client". If files flow back the other way, then we have two flows. FileMQ is not yet directory synchronization protocol, but we'll bring it quite close.</p><p>Thus, I'm going to build FileMQ as two pieces: a client and a server. Then, I'll put these together in a main application (the <code class="literal">filemq</code> tool) that can act both as client and server. The two pieces will look quite similar to the <code class="literal">nom_server</code>, with the same kind of API:</p><pre class="programlisting">
+fmq_server_t *server = fmq_server_new ();
+fmq_server_bind (server, "tcp://*:5670");
+fmq_server_publish (server, "/home/ph/filemq/share", "/public");
+fmq_server_publish (server, "/home/ph/photos/stream", "/photostream");
+
+fmq_client_t *client = fmq_client_new ();
+fmq_client_connect (client, "tcp://pieter.filemq.org:5670");
+fmq_client_subscribe (server, "/public/", "/home/ph/filemq/share");
+fmq_client_subscribe (server, "/photostream/", "/home/ph/photos/stream");
+
+while (!zctx_interrupted)
+    sleep (1);
+
+fmq_server_destroy (&amp;server);
+fmq_client_destroy (&amp;client);
+</pre><p>If we wrap this C API in other languages, we can easily script FileMQ, embed it applications, port it to smartphones, and so on.</p></div><div class="sect2" title="Initial Design Cut: the Protocol"><div class="titlepage"><div><div><h3 class="title"><a id="idp21052648"></a>Initial Design Cut: the Protocol</h3></div></div></div><p>The full name for the protocol is the "File Message Queuing Protocol", or FILEMQ in uppercase to distinguish it from the software. To start with, we write down the protocol as an ABNF grammar. Our grammar starts with the flow of commands between the client and server. You should recognize these as a combination of the various techniques we've seen already:</p><pre class="screen">filemq-protocol = open-peering *use-peering [ close-peering ]
+
+open-peering    = C:OHAI *( S:ORLY C:YARLY ) ( S:OHAI-OK / error )
+
+use-peering     = C:ICANHAZ ( S:ICANHAZ-OK / error )
+                / C:NOM
+                / S:CHEEZBURGER
+                / C:HUGZ S:HUGZ-OK
+                / S:HUGZ C:HUGZ-OK
+
+close-peering   = C:KTHXBAI / S:KTHXBAI
+
+error           = S:SRSLY / S:RTFM
+</pre><p>Here are the commands to and from the server:</p><pre class="screen">;   The client opens peering to the server
+OHAI            = signature %x01 protocol version
+signature       = %xAA %xA3
+protocol        = string        ; Must be "FILEMQ"
+string          = size *VCHAR
+size            = OCTET
+version         = %x01
+
+;   The server challenges the client using the SASL model
+ORLY            = signature %x02 mechanisms challenge
+mechanisms      = size 1*mechanism
+mechanism       = string
+challenge       = *OCTET        ; 0MQ frame
+
+;   The client responds with SASL authentication information
+YARLY           = %signature x03 mechanism response
+response        = *OCTET        ; 0MQ frame
+
+;   The server grants the client access
+OHAI-OK         = signature %x04
+
+;   The client subscribes to a virtual path
+ICANHAZ         = signature %x05 path options cache
+path            = string        ; Full path or path prefix
+options         = dictionary
+dictionary      = size *key-value
+key-value       = string        ; Formatted as name=value
+cache           = dictionary    ; File SHA-1 signatures
+
+;   The server confirms the subscription
+ICANHAZ-OK      = signature %x06
+
+;   The client sends credit to the server
+NOM             = signature %x07 credit
+credit          = 8OCTET        ; 64-bit integer, network order
+sequence        = 8OCTET        ; 64-bit integer, network order
+
+;   The server sends a chunk of file data
+CHEEZBURGER     = signature %x08 sequence operation filename
+                  offset headers chunk
+sequence        = 8OCTET        ; 64-bit integer, network order
+operation       = OCTET
+filename        = string
+offset          = 8OCTET        ; 64-bit integer, network order
+headers         = dictionary
+chunk           = FRAME
+
+;   Client or server sends a heartbeat
+HUGZ            = signature %x09
+
+;   Client or server responds to a heartbeat
+HUGZ-OK         = signature %x0A
+
+;   Client closes the peering
+KTHXBAI         = signature %x0B
+</pre><p>And here are the different ways the server can tell the client things went wrong:</p><pre class="screen">;   Server error reply - refused due to access rights
+S:SRSLY         = signature %x80 reason
+
+;   Server error reply - client sent an invalid command
+S:RTFM          = signature %x81 reason
+</pre><p>FILEMQ lives on the <a class="ulink" href="http://rfc.zeromq.org/spec:19" target="_top">ØMQ unprotocols website</a> and has a registered TCP port with IANA (the Internet Assigned Numbers Authority), which is port 5670.</p></div><div class="sect2" title="Building and Trying FileMQ"><div class="titlepage"><div><div><h3 class="title"><a id="idp21058256"></a>Building and Trying FileMQ</h3></div></div></div><p>The FileMQ stack is <a class="ulink" href="https://github.com/zeromq/filemq" target="_top">on GitHub</a>. It works like a classic C/C++ project:</p><pre class="screen">git clone git://github.com/zeromq/filemq.git
+cd filemq
+./autogen.sh
+./configure
+make check
+</pre><p>You want to be using the latest CZMQ master for this. Now try running the <code class="literal">track</code> command, which is a simple tool that uses FileMQ to track changes in one directory in another:</p><pre class="screen">cd src
+./track ./fmqroot/send ./fmqroot/recv
+</pre><p>And open two file navigator windows, one into <code class="literal">src/fmqroot/send</code> and one into <code class="literal">src/fmqroot/recv</code>. Drop files into the send folder and you'll see them arrive in the recv folder. The server checks once per second for new files. Delete files in the send folder, and they're deleted in the recv folder similarly.</p><p>I use track for things like updating my MP3 player mounted as a USB drive. As I add or remove files in my laptop's Music folder, the same changes happen on the MP3 player. FILEMQ isn't a full replication protocol yet, but we'll fix that later.</p></div><div class="sect2" title="Internal Architecture"><div class="titlepage"><div><div><h3 class="title"><a id="idp21062232"></a>Internal Architecture</h3></div></div></div><p>To build FileMQ I used a lot of code generation, possibly too much for a tutorial. However the code generators are all reusable in other stacks and will be important for our final project in A Framework for Distributed Computing<a class="xref" href="ch08.html" title="Chapter 8. A Framework for Distributed Computing">Chapter 8, <em>A Framework for Distributed Computing</em></a>. They are an evolution of the set we saw earlier:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p><code class="literal">codec_c.gsl</code>: generates a message codec for a given protocol.</p></li><li class="listitem"><p><code class="literal">server_c.gsl</code>: generates a server class for a protocol and state machine.</p></li><li class="listitem"><p><code class="literal">client_c.gsl</code>: generates a client class for a protocol and state machine.</p></li></ul></div><p>The best way to learn to use GSL code generation is to translate these into a language of your choice and make your own demo protocols and stacks. You'll find it fairly easy. FileMQ itself doesn't try to support multiple languages. It could, but it'd make things needlessly complex.</p><p>The FileMQ architecture actually slices into two layers. There's a generic set of classes to handle chunks, directories, files, patches, SASL security, and configuration files. Then, there's the generated stack: messages, client, and server. If I was creating a new project I'd fork the whole FileMQ project, and go and modify the three models:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p><code class="literal">fmq_msg.xml</code>: defines the message formats</p></li><li class="listitem"><p><code class="literal">fmq_client.xml</code>: defines the client state machine, API, and implementation.</p></li><li class="listitem"><p><code class="literal">fmq_server.xml</code>: does the same for the server.</p></li></ul></div><p>You'd want to rename things to avoid confusion. Why didn't I make the reusable classes into a separate library? The answer is two-fold. First, no one actually needs this (yet). Second, it'd make things more complex for you as you build and play with FileMQ. It's never worth adding complexity to solve a theoretical problem.</p><p>Although I wrote FileMQ in C, it's easy to map to other languages. It is quite amazing how nice C becomes when you add CZMQ's generic zlist and zhash containers and class style. Let me go through the classes quickly:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p><code class="literal">fmq_sasl</code>: encodes and decodes a SASL challenge. I only implemented the PLAIN mechanism, which is enough to prove the concept.</p></li><li class="listitem"><p><code class="literal">fmq_chunk</code>: works with variable sized blobs. Not as efficient as ØMQ's messages but they do less weirdness and so are easier to understand. The chunk class has methods to read and write chunks from disk.</p></li><li class="listitem"><p><code class="literal">fmq_file</code>: works with files, which may or may not exist on disk. Gives you information about a file (like size), lets you read and write to files, remove files, check if a file exists, and check if a file is "stable" (more on that later).</p></li><li class="listitem"><p><code class="literal">fmq_dir</code>: works with directories, reading them from disk and comparing two directories to see what changed. When there are changes, returns a list of "patches".</p></li><li class="listitem"><p><code class="literal">fmq_patch</code>: works with one patch, which really just says "create this file" or "delete this file" (referring to a fmq_file item each time).</p></li><li class="listitem"><p><code class="literal">fmq_config</code>: works with configuration data. I'll come back to client and server configuration later.</p></li></ul></div><p>Every class has a test method, and the main development cycle is "edit, test". These are mostly simple self tests, but they make the difference between code I can trust and code I know will still break. It's a safe bet that any code that isn't covered by a test case will have undiscovered errors. I'm not a fan of external test harnesses. But internal test code that you write as you write your functionality... that's like the handle on a knife.</p><p>You should, really, be able to read the source code and rapidly understand what these classes are doing. If you can't read the code happily, tell me. If you want to port the FileMQ implementation into other languages, start by forking the whole repository and later we'll see if it's possible to do this in one overall repo.</p></div><div class="sect2" title="Public API"><div class="titlepage"><div><div><h3 class="title"><a id="idp21074432"></a>Public API</h3></div></div></div><p>The public API consists of two classes (as we sketched earlier):</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p><code class="literal">fmq_client</code>: provides the client API, with methods to connect to a server, configure the client, and subscribe to paths.</p></li><li class="listitem"><p><code class="literal">fmq_server</code>: provides the server API, with methods to bind to a port, configure the server, and publish a path.</p></li></ul></div><p>These classes provide an <span class="emphasis"><em>multithreaded API</em></span>, a model we've used a few times now. When you create an API instance (i.e., <code class="literal">fmq_server_new()</code> or <code class="literal">fmq_client_new()</code>), this method kicks off a background thread that does the real work, i.e., runs the server or the client. The other API methods then talk to this thread over ØMQ sockets (a <span class="emphasis"><em>pipe</em></span> consisting of two PAIR sockets over inproc://).</p><p>If I was a keen young developer eager to use FileMQ in another language, I'd probably spend a happy weekend writing a binding for this public API, then stick it in a subdirectory of the filemq project called, say, <code class="literal">bindings/</code>, and make a pull request.</p><p>The actual API methods come from the state machine description, like this (for the server):</p><pre class="screen">&lt;method name = "publish"&gt;
+&lt;argument name = "location" type = "string" /&gt;
+&lt;argument name = "alias" type = "string" /&gt;
+mount_t *mount = mount_new (location, alias);
+zlist_append (self-&gt;mounts, mount);
+&lt;/method&gt;
+</pre><p>Which gets turned into this code:</p><pre class="programlisting">
+void
+fmq_server_publish (fmq_server_t *self, char *location, char *alias)
+{
+    assert (self);
+    assert (location);
+    assert (alias);
+    zstr_sendm (self-&gt;pipe, "PUBLISH");
+    zstr_sendfm (self-&gt;pipe, "%s", location);
+    zstr_sendf (self-&gt;pipe, "%s", alias);
+}
+</pre></div><div class="sect2" title="Design Notes"><div class="titlepage"><div><div><h3 class="title"><a id="idp21080776"></a>Design Notes</h3></div></div></div><p>The hardest part of making FileMQ wasn't implementing the protocol, but maintaining accurate state internally. An FTP or HTTP server is essentially stateless. But a publish/subscribe server <span class="emphasis"><em>has</em></span> to maintain subscriptions, at least.</p><p>So I'll go through some of the design aspects:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The client detects if the server has died by the lack of heartbeats (<code class="literal">HUGZ</code>) coming from the server. It then restarts its dialog by sending an <code class="literal">OHAI</code>. There's no timeout on the <code class="literal">OHAI</code> because the ØMQ DEALER socket will queue an outgoing message indefinitely.</p></li><li class="listitem"><p>If a client stops replying with (<code class="literal">HUGZ-OK</code>) to the heartbeats that the server sends, the server concludes that the client has died and deletes all state for the client including its subscriptions.</p></li><li class="listitem"><p>The client API holds subscriptions in memory and replays them when it has connected successfully. This means the caller can subscribe at any time (and doesn't care when connections and authentication actually happen).</p></li><li class="listitem"><p>The server and client use virtual paths, much like an HTTP or FTP server. You publish one or more <span class="emphasis"><em>mount points</em></span>, each corresponding to a directory on the server. Each of these maps to some virtual path, for instance "/" if you have only one mount point. Clients then subscribe to virtual paths, and files arrive in an inbox directory. We don't send physical file names across the network.</p></li><li class="listitem"><p>There are some timing issues: if the server is creating its mount points while clients are connected and subscribing, the subscriptions won't attach to the right mount points. So, we bind the server port as last thing.</p></li><li class="listitem"><p>Clients can reconnect at any point; if the client sends <code class="literal">OHAI</code>, that signals the end of any previous conversation and the start of a new one. I might one day make subscriptions durable on the server, so they survive a disconnection. The client stack, after reconnecting, replays any subscriptions the caller application already made.</p></li></ul></div></div><div class="sect2" title="Configuration"><div class="titlepage"><div><div><h3 class="title"><a id="idp21087192"></a>Configuration</h3></div></div></div><p>I've built several large server products, like the Xitami web server that was popular in the late 90's, and the <a class="ulink" href="http://www.openamq.org" target="_top">OpenAMQ messaging server</a>. Getting configuration easy and obvious was a large part of making these servers fun to use.</p><p>We typically aim to solve a number of problems:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Ship default configuration files with the product.</p></li><li class="listitem"><p>Allow users to add custom configuration files that are never overwritten.</p></li><li class="listitem"><p>Allow users to configure from the command-line.</p></li></ul></div><p>And then layer these one on the other, so command-line settings override custom settings, which override default settings. It can be a lot of work to do this right. For FileMQ, I've taken a somewhat simpler approach: all configuration is done from the API.</p><p>This is how we start and configure the server, for example:</p><pre class="programlisting">
+server = fmq_server_new ();
+fmq_server_configure (server, "server_test.cfg");
+fmq_server_publish (server, "./fmqroot/send", "/");
+fmq_server_publish (server, "./fmqroot/logs", "/logs");
+fmq_server_bind (server, "tcp://*:5670");
+</pre><p>We do use a specific format for the config files, which is <a class="ulink" href="http://rfc.zeromq.org/spec:4" target="_top">ZPL</a>, a minimalist syntax that we started using for ØMQ "devices" a few years ago, but which works well for any server:</p><pre class="screen">#   Configure server for plain access
+#
+server
+    monitor = 1             #   Check mount points
+    heartbeat = 1           #   Heartbeat to clients
+
+publish
+    location = ./fmqroot/logs
+    virtual = /logs
+
+security
+    echo = I: use guest/guest to login to server
+    #   These are SASL mechanisms we accept
+    anonymous = 0
+    plain = 1
+        account
+            login = guest
+            password = guest
+            group = guest
+        account
+            login = super
+            password = secret
+            group = admin
+</pre><p>One cute thing (which seems useful) the generated server code does is to parse this config file (when you use the <code class="literal">fmq_server_configure()</code> method) and execute any section that matches an API method. Thus the <code class="literal">publish</code> section works as a <code class="literal">fmq_server_publish()</code> method.</p></div><div class="sect2" title="File Stability"><div class="titlepage"><div><div><h3 class="title"><a id="idp21094016"></a>File Stability</h3></div></div></div><p>It is quite common to poll a directory for changes and then do something "interesting" with new files. But as one process is writing to a file, other processes have no idea when the file has been fully written. One solution is to add a second "indicator" file that we create after creating the first file. This is intrusive, however.</p><p>There is a neater way, which is to detect when a file is "stable", i.e., no one is writing to it any longer. FileMQ does this by checking the modification time of the file. If it's more than a second old, then the file is considered stable, at least stable enough to be shipped off to clients. If a process comes along after five minutes and appends to the file, it'll be shipped off again.</p><p>For this to work, and this is a requirement for any application hoping to use FileMQ successfully, do not buffer more than a second's worth of data in memory before writing. If you use very large block sizes, the file may look stable when it's not.</p></div><div class="sect2" title="Delivery Notifications"><div class="titlepage"><div><div><h3 class="title"><a id="idp21095976"></a>Delivery Notifications</h3></div></div></div><p>One of the nice things about the multithreaded API model we're using is that it's essentially message based. This makes it ideal for returning events back to the caller. A more conventional API approach would be to use callbacks. But callbacks that cross thread boundaries are somewhat delicate. Here's how the client sends a message back when it has received a complete file:</p><pre class="programlisting">
+zstr_sendm (self-&gt;pipe, "DELIVER");
+zstr_sendm (self-&gt;pipe, filename);
+zstr_sendf (self-&gt;pipe, "%s/%s", inbox, filename);
+</pre><p>We can now add a _recv() method to the API that waits for events back from the client. It makes a clean style for the caller: create the client object, configure it, and then receive and process any events it returns.</p></div><div class="sect2" title="Symbolic Links"><div class="titlepage"><div><div><h3 class="title"><a id="idp21097944"></a>Symbolic Links</h3></div></div></div><p>While using a staging area is a nice, simple API, it also creates costs for senders. If I already have a 2GB video file on a camera, and want to send it via FileMQ, the current implementation asks that I copy it to a staging area before it will be sent to subscribers.</p><p>One option is to mount the whole content directory (e.g., <code class="literal">/home/me/Movies</code>), but this is fragile because it means the application can't decide to send individual files. It's everything or nothing.</p><p>A simple answer is to implement portable symbolic links. As Wikipedia explains: "A symbolic link contains a text string that is automatically interpreted and followed by the operating system as a path to another file or directory. This other file or directory is called the <span class="emphasis"><em>target</em></span>. The symbolic link is a second file that exists independently of its target. If a symbolic link is deleted, its target remains unaffected."</p><p>This doesn't affect the protocol in any way; it's an optimization in the server implementation. Let's make a simple portable implementation:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>A symbolic link consists of a file with the extension <code class="literal">.ln</code>.</p></li><li class="listitem"><p>The filename without <code class="literal">.ln</code> is the published file name.</p></li><li class="listitem"><p>The link file contains one line, which is the real path to the file.</p></li></ul></div><p>Because we've collected all operations on files in a single class (<code class="literal">fmq_file</code>), it's a clean change. When we create a new file object, we check if it's a symbolic link and then all read-only actions (get file size, read file) operate on the target file, not the link.</p></div><div class="sect2" title="Recovery and Late Joiners"><div class="titlepage"><div><div><h3 class="title"><a id="idp21103200"></a>Recovery and Late Joiners</h3></div></div></div><p>As it stands now, FileMQ has one major remaining problem: it provides no way for clients to recover from failures. The scenario is that a client, connected to a server, starts to receive files and then disconnects for some reason. The network may be too slow, or breaks. The client may be on a laptop which is shut down, then resumed. The WiFi may be disconnected. As we move to a more mobile world (see A Framework for Distributed Computing<a class="xref" href="ch08.html" title="Chapter 8. A Framework for Distributed Computing">Chapter 8, <em>A Framework for Distributed Computing</em></a>) this use case becomes more and more frequent. In some ways it's becoming a dominant use case.</p><p>In the classic ØMQ pub-sub pattern, there are two strong underlying assumptions, both of which are usually wrong in FileMQ's real world. First, that data expires very rapidly so that there's no interest in asking from old data. Second, that networks are stable and rarely break (so it's better to invest more in improving the infrastructure and less in addressing recovery).</p><p>Take any FileMQ use case and you'll see that if the client disconnects and reconnects, then it should get anything it missed. A further improvement would be to recover from partial failures, like HTTP and FTP do. But one thing at a time.</p><p>One answer to recovery is "durable subscriptions", and the first drafts of the FILEMQ protocol aimed to support this, with client identifiers that the server could hold onto and store. So if a client reappears after a failure, the server would know what files it had not received.</p><p>Stateful servers are, however, nasty to make and difficult to scale. How do we, for example, do failover to a secondary server? Where does it get its subscriptions from? It's far nicer if each client connection works independently and carries all necessary state with it.</p><p>Another nail in the coffin of durable subscriptions is that it requires up-front coordination. Up-front coordination is always a red flag, whether it's in a team of people working together, or a bunch of processes talking to each other. What about late joiners? In the real world, clients do not neatly line up and then all say "Ready!" at the same time. In the real world, they come and go arbitrarily, and it's valuable if we can treat a brand new client in the same way as a client that went away and came back.</p><p>To address this I will add two concepts to the protocol: a <span class="emphasis"><em>resynchronization</em></span> option and a <code class="literal">cache</code> field (a dictionary). If the client wants recovery, it sets the resynchronization option, and tells the server what files it already has via the <code class="literal">cache</code> field. We need both, because there's no way in the protocol to distinguish between an empty field and a null field. The FILEMQ RFC describes these fields as follows:</p><div class="blockquote"><blockquote class="blockquote"><p>The <code class="literal">options</code> field provides additional information to the server. The server SHOULD implement these options: <code class="literal">RESYNC=1</code> - if the client sets this, the server SHALL send the full contents of the virtual path to the client, except files the client already has, as identified by their SHA-1 digest in the <code class="literal">cache</code> field.</p></blockquote></div><p>And:</p><div class="blockquote"><blockquote class="blockquote"><p>When the client specifies the <code class="literal">RESYNC</code> option, the <code class="literal">cache</code> dictionary field tells the server which files the client already has. Each entry in the <code class="literal">cache</code> dictionary is a "filename=digest" key/value pair where the digest SHALL be a SHA-1 digest in printable hexadecimal format. If the filename starts with "/" then it SHOULD start with the path, otherwise the server MUST ignore it. If the filename does not start with "/" then the server SHALL treat it as relative to the path.</p></blockquote></div><p>Clients that know they are in the classic pub-sub use case just don't provide any cache data, and clients that want recovery provide their cache data. It requires no state in the server, no up-front coordination, and works equally well for brand new clients (which may have received files via some out-of-band means), and clients that received some files and were then disconnected for a while.</p><p>I decided to use SHA-1 digests for several reasons. First, it's fast enough: 150msec to digest a 25MB core dump on my laptop. Second, it's reliable: the chance of getting the same hash for different versions of one file is close enough to zero. Third, it's the widest supported digest algorithm. A cyclic-redundancy check (e.g., CRC-32) is faster but not reliable. More recent SHA versions (SHA-256, SHA-512) are more secure but take 50% more CPU cycles, and are overkill for our needs.</p><p>Here is what a typical ICANHAZ message looks like when we use both caching and resyncing (this is output from the <code class="literal">dump</code> method of the generated codec class):</p><pre class="screen">ICANHAZ:
+    path='/photos'
+    options={
+        RESYNC=1
+    }
+    cache={
+        DSCF0001.jpg=1FABCD4259140ACA99E991E7ADD2034AC57D341D
+        DSCF0006.jpg=01267C7641C5A22F2F4B0174FFB0C94DC59866F6
+        DSCF0005.jpg=698E88C05B5C280E75C055444227FEA6FB60E564
+        DSCF0004.jpg=F0149101DD6FEC13238E6FD9CA2F2AC62829CBD0
+        DSCF0003.jpg=4A49F25E2030B60134F109ABD0AD9642C8577441
+        DSCF0002.jpg=F84E4D69D854D4BF94B5873132F9892C8B5FA94E
+    }
+</pre><p>Although we don't do this in FileMQ, the server can use the cache information to help the client catch up with deletions that it missed. To do this, it would have to log deletions, and then compare this log with the client cache when a client subscribes.</p></div><div class="sect2" title="Test Use Case: The Track Tool"><div class="titlepage"><div><div><h3 class="title"><a id="idp21115440"></a>Test Use Case: The Track Tool</h3></div></div></div><p>To properly test something like FileMQ we need a test case that plays with live data. One of my sysadmin tasks is to manage the MP3 tracks on my music player, which is, by the way, a Sansa Clip reflashed with Rock Box, which I highly recommend. As I download tracks into my Music folder, I want to copy these to my player, and as I find tracks that annoy me, I delete them in the Music folder and want those gone from my player too.</p><p>This is kind of overkill for a powerful file distribution protocol. I could write this using a bash or Perl script, but to be honest the hardest work in FileMQ was the directory comparison code and I want to benefit from that. So I put together a simple tool called <code class="literal">track</code>, which calls the FileMQ API. From the command line this runs with two arguments; the sending and the receiving directories:</p><pre class="screen">./track /home/ph/Music /media/3230-6364/MUSIC
+</pre><p>The code is a neat example of how to use the FileMQ API to do local file distribution. Here is the full program, minus the license text (it's MIT/X11 licensed):</p><pre class="programlisting">
+#include "czmq.h"
+#include "../include/fmq.h"
+
+int main (int argc, char *argv [])
+{
+    fmq_server_t *server = fmq_server_new ();
+    fmq_server_configure (server, "anonymous.cfg");
+    fmq_server_publish (server, argv [1], "/");
+    fmq_server_set_anonymous (server, true);
+    fmq_server_bind (server, "tcp://*:5670");
+
+    fmq_client_t *client = fmq_client_new ();
+    fmq_client_connect (client, "tcp://localhost:5670");
+    fmq_client_set_inbox (client, argv [2]);
+    fmq_client_set_resync (client, true);
+    fmq_client_subscribe (client, "/");
+
+    while (true) {
+        //  Get message from fmq_client API
+        zmsg_t *msg = fmq_client_recv (client);
+        if (!msg)
+            break;              //  Interrupted
+        char *command = zmsg_popstr (msg);
+        if (streq (command, "DELIVER")) {
+            char *filename = zmsg_popstr (msg);
+            char *fullname = zmsg_popstr (msg);
+            printf ("I: received %s (%s)\n", filename, fullname);
+            free (filename);
+            free (fullname);
+        }
+        free (command);
+        zmsg_destroy (&amp;msg);
+    }
+    fmq_server_destroy (&amp;server);
+    fmq_client_destroy (&amp;client);
+    return 0;
+}
+</pre><p>Note how we work with physical paths in this tool. The server publishes the physical path <code class="literal">/home/ph/Music</code> and maps this to the virtual path <code class="literal">/</code>. The client subscribes to <code class="literal">/</code> and receives all files in {{/media/3230-6364/MUSIC"". I could use any structure within the server directory, and it would be copied faithfully to the client's inbox. Note the API method <code class="literal">    fmq_client_set_resync ()</code>, which causes a server-to-client synchronization.</p></div></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch07s06.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch07.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch07s08.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Authentication Using SASL </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Getting an Official Port Number</td></tr></table></div></body></html>

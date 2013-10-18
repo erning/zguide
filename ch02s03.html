@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Handling Errors and ETERM</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch02.html" title="Chapter 2. Sockets and Patterns" /><link rel="prev" href="ch02s02.html" title="Messaging Patterns" /><link rel="next" href="ch02s04.html" title="Handling Interrupt Signals" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Handling Errors and ETERM</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch02s02.html">Prev</a> </td><th width="60%" align="center">Chapter 2. Sockets and Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch02s04.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Handling Errors and ETERM"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp19236200"></a>Handling Errors and ETERM</h2></div></div></div><p>ØMQ's error handling philosophy is a mix of fail-fast and resilience. Processes, we believe, should be as vulnerable as possible to internal errors, and as robust as possible against external attacks and errors. To give an analogy, a living cell will self-destruct if it detects a single internal error, yet it will resist attack from the outside by all means possible.</p><p>Assertions, which pepper the ØMQ code, are absolutely vital to robust code; they just have to be on the right side of the cellular wall. And there should be such a wall. If it is unclear whether a fault is internal or external, that is a design flaw to be fixed. In C/C++, assertions stop the application immediately with an error. In other languages, you may get exceptions or halts.</p><p>When ØMQ detects an external fault it returns an error to the calling code. In some rare cases, it drops messages silently if there is no obvious strategy for recovering from the error.</p><p>In most of the C examples we've seen so far there's been no error handling. <span class="bold"><strong>Real code should do error handling on every single ØMQ call</strong></span>. If you're using a language binding other than C, the binding may handle errors for you. In C, you do need to do this yourself. There are some simple rules, starting with POSIX conventions:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Methods that create objects return NULL if they fail.</p></li><li class="listitem"><p>Methods that process data may return the number of bytes processed, or -1 on an error or failure.</p></li><li class="listitem"><p>Other methods return 0 on success and -1 on an error or failure.</p></li><li class="listitem"><p>The error code is provided in <code class="literal">errno</code> or <code class="literal">zmq_errno()</code>.</p></li><li class="listitem"><p>A descriptive error text for logging is provided by <code class="literal">zmq_strerror()</code>.</p></li></ul></div><p>For example:</p><pre class="programlisting">
+void *context = zmq_ctx_new ();
+assert (context);
+void *socket = zmq_socket (context, ZMQ_REP);
+assert (socket);
+int rc = zmq_bind (socket, "tcp://*:5555");
+if (rc == -1) {
+    printf ("E: bind failed: %s\n", strerror (errno));
+    return -1;
+}
+</pre><p>There are two main exceptional conditions that you should handle as nonfatal:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>When your code receives a message with the <code class="literal">ZMQ_DONTWAIT</code> option and there is no waiting data, ØMQ will return -1 and set <code class="literal">errno</code> to <code class="literal">EAGAIN</code>.</p></li><li class="listitem"><p>When one thread calls <code class="literal">zmq_ctx_destroy()</code>, and other threads are still doing blocking work, the <code class="literal">zmq_ctx_destroy()</code> call closes the context and all blocking calls exit with -1, and <code class="literal">errno</code> set to <code class="literal">ETERM</code>.</p></li></ul></div><p>In C/C++, asserts can be removed entirely in optimized code, so don't make the mistake of wrapping the whole ØMQ call in an <code class="literal">assert()</code>. It looks neat; then the optimizer removes all the asserts and the calls you want to make, and your application breaks in impressive ways.</p><div class="figure"><a id="figure-19"></a><p class="title"><strong>Figure 2.11. Parallel Pipeline with Kill Signaling</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig19.png" alt="Parallel Pipeline with Kill Signaling" /></div></div></div><br class="figure-break" /><p>Let's see how to shut down a process cleanly. We'll take the parallel pipeline example from the previous section. If we've started a whole lot of workers in the background, we now want to kill them when the batch is finished. Let's do this by sending a kill message to the workers. The best place to do this is the sink because it really knows when the batch is done.</p><p>How do we connect the sink to the workers? The PUSH/PULL sockets are one-way only. We could switch to another socket type, or we could mix multiple socket flows. Let's try the latter: using a pub-sub model to send kill messages to the workers<a class="xref" href="ch02s06.html#figure-20" title="Figure 2.12. Multithreaded Server">Figure 2.12, “Multithreaded Server”</a>:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The sink creates a PUB socket on a new endpoint.</p></li><li class="listitem"><p>Workers bind their input socket to this endpoint.</p></li><li class="listitem"><p>When the sink detects the end of the batch, it sends a kill to its PUB socket.</p></li><li class="listitem"><p>When a worker detects this kill message, it exits.</p></li></ul></div><p>It doesn't take much new code in the sink:</p><pre class="programlisting">
+void *control = zmq_socket (context, ZMQ_PUB);
+zmq_bind (control, "tcp://*:5559");
+...
+//  Send kill signal to workers
+s_send (controller, "KILL");
+</pre><p>Here is the worker process, which manages two sockets (a PULL socket getting tasks, and a SUB socket getting control commands), using the <code class="literal">zmq_poll()</code> technique we saw earlier:</p><div class="example"><a id="taskwork2-c"></a><p class="title"><strong>Example 2.8. Parallel task worker with kill signaling (taskwork2.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Task worker - design 2
+//  Adds pub-sub flow to receive and respond to kill signal
+
+#include "zhelpers.h"
+
+int main (void) 
+{
+    //  Socket to receive messages on
+    void *context = zmq_ctx_new ();
+    void *receiver = zmq_socket (context, ZMQ_PULL);
+    zmq_connect (receiver, "tcp://localhost:5557");
+
+    //  Socket to send messages to
+    void *sender = zmq_socket (context, ZMQ_PUSH);
+    zmq_connect (sender, "tcp://localhost:5558");
+
+    //  Socket for control input
+    void *controller = zmq_socket (context, ZMQ_SUB);
+    zmq_connect (controller, "tcp://localhost:5559");
+    zmq_setsockopt (controller, ZMQ_SUBSCRIBE, "", 0);
+
+    //  Process messages from either socket
+    while (1) {
+        zmq_pollitem_t items [] = {
+            { receiver, 0, ZMQ_POLLIN, 0 },
+            { controller, 0, ZMQ_POLLIN, 0 }
+        };
+        zmq_poll (items, 2, -1);
+        if (items [0].revents &amp; ZMQ_POLLIN) {
+            char *string = s_recv (receiver);
+            printf ("%s.", string);     //  Show progress
+            fflush (stdout);
+            s_sleep (atoi (string));    //  Do the work
+            free (string);
+            s_send (sender, "");        //  Send results to sink
+        }
+        //  Any waiting controller command acts as 'KILL'
+        if (items [1].revents &amp; ZMQ_POLLIN)
+            break;                      //  Exit loop
+    }
+    zmq_close (receiver);
+    zmq_close (sender);
+    zmq_close (controller);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>Here is the modified sink application. When it's finished collecting results, it broadcasts a kill message to all workers:</p><div class="example"><a id="tasksink2-c"></a><p class="title"><strong>Example 2.9. Parallel task sink with kill signaling (tasksink2.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Task sink - design 2
+//  Adds pub-sub flow to send kill signal to workers
+
+#include "zhelpers.h"
+
+int main (void) 
+{
+    //  Socket to receive messages on
+    void *context = zmq_ctx_new ();
+    void *receiver = zmq_socket (context, ZMQ_PULL);
+    zmq_bind (receiver, "tcp://*:5558");
+
+    //  Socket for worker control
+    void *controller = zmq_socket (context, ZMQ_PUB);
+    zmq_bind (controller, "tcp://*:5559");
+
+    //  Wait for start of batch
+    char *string = s_recv (receiver);
+    free (string);
+    
+    //  Start our clock now
+    int64_t start_time = s_clock ();
+
+    //  Process 100 confirmations
+    int task_nbr;
+    for (task_nbr = 0; task_nbr &lt; 100; task_nbr++) {
+        char *string = s_recv (receiver);
+        free (string);
+        if ((task_nbr / 10) * 10 == task_nbr)
+            printf (":");
+        else
+            printf (".");
+        fflush (stdout);
+    }
+    printf ("Total elapsed time: %d msec\n", 
+        (int) (s_clock () - start_time));
+
+    //  Send kill signal to workers
+    s_send (controller, "KILL");
+
+    zmq_close (receiver);
+    zmq_close (controller);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch02s02.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch02.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch02s04.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Messaging Patterns </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Handling Interrupt Signals</td></tr></table></div></body></html>

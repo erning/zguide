@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Pub-Sub Message Envelopes</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch02.html" title="Chapter 2. Sockets and Patterns" /><link rel="prev" href="ch02s09.html" title="Zero-Copy" /><link rel="next" href="ch02s11.html" title="High-Water Marks" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Pub-Sub Message Envelopes</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch02s09.html">Prev</a> </td><th width="60%" align="center">Chapter 2. Sockets and Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch02s11.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Pub-Sub Message Envelopes"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp19333600"></a>Pub-Sub Message Envelopes</h2></div></div></div><p>In the pub-sub pattern, we can split the key into a separate message frame that we call an <span class="emphasis"><em>envelope</em></span><a class="xref" href="ch02s10.html#figure-23" title="Figure 2.15. Pub-Sub Envelope with Separate Key">Figure 2.15, “Pub-Sub Envelope with Separate Key”</a>. If you want to use pub-sub envelopes, make them yourself. It's optional, and in previous pub-sub examples we didn't do this. Using a pub-sub envelope is a little more work for simple cases, but it's cleaner especially for real cases, where the key and the data are naturally separate things.</p><div class="figure"><a id="figure-23"></a><p class="title"><strong>Figure 2.15. Pub-Sub Envelope with Separate Key</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig23.png" alt="Pub-Sub Envelope with Separate Key" /></div></div></div><br class="figure-break" /><p>Recall that subscriptions do a prefix match. That is, they look for "all messages starting with XYZ". The obvious question is: how to delimit keys from data so that the prefix match doesn't accidentally match data. The best answer is to use an envelope because the match won't cross a frame boundary. Here is a minimalist example of how pub-sub envelopes look in code. This publisher sends messages of two types, A and B.</p><p>The envelope holds the message type:</p><div class="example"><a id="psenvpub-c"></a><p class="title"><strong>Example 2.15. Pub-Sub envelope publisher (psenvpub.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Pubsub envelope publisher
+//  Note that the zhelpers.h file also provides s_sendmore
+
+#include "zhelpers.h"
+
+int main (void)
+{
+    //  Prepare our context and publisher
+    void *context = zmq_ctx_new ();
+    void *publisher = zmq_socket (context, ZMQ_PUB);
+    zmq_bind (publisher, "tcp://*:5563");
+
+    while (1) {
+        //  Write two messages, each with an envelope and content
+        s_sendmore (publisher, "A");
+        s_send (publisher, "We don't want to see this");
+        s_sendmore (publisher, "B");
+        s_send (publisher, "We would like to see this");
+        sleep (1);
+    }
+    //  We never get here, but clean up anyhow
+    zmq_close (publisher);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>The subscriber wants only messages of type B:</p><div class="example"><a id="psenvsub-c"></a><p class="title"><strong>Example 2.16. Pub-Sub envelope subscriber (psenvsub.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Pubsub envelope subscriber
+
+#include "zhelpers.h"
+
+int main (void)
+{
+    //  Prepare our context and subscriber
+    void *context = zmq_ctx_new ();
+    void *subscriber = zmq_socket (context, ZMQ_SUB);
+    zmq_connect (subscriber, "tcp://localhost:5563");
+    zmq_setsockopt (subscriber, ZMQ_SUBSCRIBE, "B", 1);
+
+    while (1) {
+        //  Read envelope with address
+        char *address = s_recv (subscriber);
+        //  Read message contents
+        char *contents = s_recv (subscriber);
+        printf ("[%s] %s\n", address, contents);
+        free (address);
+        free (contents);
+    }
+    //  We never get here, but clean up anyhow
+    zmq_close (subscriber);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>When you run the two programs, the subscriber should show you this:</p><pre class="screen">[B] We would like to see this
+[B] We would like to see this
+[B] We would like to see this
+...
+</pre><p>This example shows that the subscription filter rejects or accepts the entire multipart message (key plus data). You won't get part of a multipart message, ever. If you subscribe to multiple publishers and you want to know their address so that you can send them data via another socket (and this is a typical use case), create a three-part message<a class="xref" href="ch02s10.html#figure-24" title="Figure 2.16. Pub-Sub Envelope with Sender Address">Figure 2.16, “Pub-Sub Envelope with Sender Address”</a>.</p><div class="figure"><a id="figure-24"></a><p class="title"><strong>Figure 2.16. Pub-Sub Envelope with Sender Address</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig24.png" alt="Pub-Sub Envelope with Sender Address" /></div></div></div><br class="figure-break" /></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch02s09.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch02.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch02s11.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Zero-Copy </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> High-Water Marks</td></tr></table></div></body></html>

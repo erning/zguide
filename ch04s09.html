@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Asynchronous Majordomo Pattern</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch04.html" title="Chapter 4. Reliable Request-Reply Patterns" /><link rel="prev" href="ch04s08.html" title="Service-Oriented Reliable Queuing (Majordomo Pattern)" /><link rel="next" href="ch04s10.html" title="Service Discovery" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Asynchronous Majordomo Pattern</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch04s08.html">Prev</a> </td><th width="60%" align="center">Chapter 4. Reliable Request-Reply Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch04s10.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Asynchronous Majordomo Pattern"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp19881952"></a>Asynchronous Majordomo Pattern</h2></div></div></div><p>The Majordomo implementation in the previous section is simple and stupid. The client is just the original Simple Pirate, wrapped up in a sexy API. When I fire up a client, broker, and worker on a test box, it can process 100,000 requests in about 14 seconds. That is partially due to the code, which cheerfully copies message frames around as if CPU cycles were free. But the real problem is that we're doing network round-trips. ØMQ disables <a class="ulink" href="http://en.wikipedia.org/wiki/Nagles_algorithm" target="_top">Nagle's algorithm</a>, but round-tripping is still slow.</p><p>Theory is great in theory, but in practice, practice is better. Let's measure the actual cost of round-tripping with a simple test program. This sends a bunch of messages, first waiting for a reply to each message, and second as a batch, reading all the replies back as a batch. Both approaches do the same work, but they give very different results. We mock up a client, broker, and worker:</p><div class="example"><a id="tripping-c"></a><p class="title"><strong>Example 4.46. Round-trip demonstrator (tripping.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Round-trip demonstrator
+//  While this example runs in a single process, that is just to make
+//  it easier to start and stop the example. The client task signals to
+//  main when it's ready.
+
+#include "czmq.h"
+
+static void
+client_task (void *args, zctx_t *ctx, void *pipe)
+{
+    void *client = zsocket_new (ctx, ZMQ_DEALER);
+    zsocket_connect (client, "tcp://localhost:5555");
+    printf ("Setting up test...\n");
+    zclock_sleep (100);
+
+    int requests;
+    int64_t start;
+
+    printf ("Synchronous round-trip test...\n");
+    start = zclock_time ();
+    for (requests = 0; requests &lt; 10000; requests++) {
+        zstr_send (client, "hello");
+        char *reply = zstr_recv (client);
+        free (reply);
+    }
+    printf (" %d calls/second\n",
+        (1000 * 10000) / (int) (zclock_time () - start));
+
+    printf ("Asynchronous round-trip test...\n");
+    start = zclock_time ();
+    for (requests = 0; requests &lt; 100000; requests++)
+        zstr_send (client, "hello");
+    for (requests = 0; requests &lt; 100000; requests++) {
+        char *reply = zstr_recv (client);
+        free (reply);
+    }
+    printf (" %d calls/second\n",
+        (1000 * 100000) / (int) (zclock_time () - start));
+    zstr_send (pipe, "done");
+}
+</pre></div></div><br class="example-break" /><p>Here is the worker task. All it does is receive a message, and bounce it back the way it came: 
+</p><div class="example"><a id="tripping-c-1"></a><p class="title"><strong>Example 4.47. Round-trip demonstrator (tripping.c) - worker task</strong></p><div class="example-contents"><pre class="programlisting">
+
+static void *
+worker_task (void *args)
+{
+    zctx_t *ctx = zctx_new ();
+    void *worker = zsocket_new (ctx, ZMQ_DEALER);
+    zsocket_connect (worker, "tcp://localhost:5556");
+    
+    while (true) {
+        zmsg_t *msg = zmsg_recv (worker);
+        zmsg_send (&amp;msg, worker);
+    }
+    zctx_destroy (&amp;ctx);
+    return NULL;
+}
+</pre></div></div><br class="example-break" /><p>Here is the broker task. It uses the <code class="literal">zmq_proxy</code> function to switch messages between frontend and backend: 
+</p><div class="example"><a id="tripping-c-2"></a><p class="title"><strong>Example 4.48. Round-trip demonstrator (tripping.c) - broker task</strong></p><div class="example-contents"><pre class="programlisting">
+
+static void *
+broker_task (void *args)
+{
+    //  Prepare our context and sockets
+    zctx_t *ctx = zctx_new ();
+    void *frontend = zsocket_new (ctx, ZMQ_DEALER);
+    zsocket_bind (frontend, "tcp://*:5555");
+    void *backend = zsocket_new (ctx, ZMQ_DEALER);
+    zsocket_bind (backend, "tcp://*:5556");
+    zmq_proxy (frontend, backend, NULL);
+    zctx_destroy (&amp;ctx);
+    return NULL;
+}
+</pre></div></div><br class="example-break" /><p>Finally, here's the main task, which starts the client, worker, and broker, and then runs until the client signals it to stop: 
+</p><div class="example"><a id="tripping-c-3"></a><p class="title"><strong>Example 4.49. Round-trip demonstrator (tripping.c) - main task</strong></p><div class="example-contents"><pre class="programlisting">
+
+int main (void)
+{
+    //  Create threads
+    zctx_t *ctx = zctx_new ();
+    void *client = zthread_fork (ctx, client_task, NULL);
+    zthread_new (worker_task, NULL);
+    zthread_new (broker_task, NULL);
+
+    //  Wait for signal on client pipe
+    char *signal = zstr_recv (client);
+    free (signal);
+
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>On my development box, this program says:</p><pre class="screen">Setting up test...
+Synchronous round-trip test...
+ 9057 calls/second
+Asynchronous round-trip test...
+ 173010 calls/second
+</pre><p>Note that the client thread does a small pause before starting. This is to get around one of the "features" of the router socket: if you send a message with the address of a peer that's not yet connected, the message gets discarded. In this example we don't use the load balancing mechanism, so without the sleep, if the worker thread is too slow to connect, it will lose messages, making a mess of our test.</p><p>As we see, round-tripping in the simplest case is 20 times slower than the  asynchronous, "shove it down the pipe as fast as it'll go" approach. Let's see if we can apply this to Majordomo to make it faster.</p><p>First, we modify the client API to send and receive in two separate methods:</p><pre class="programlisting">
+mdcli_t *mdcli_new     (char *broker);
+void     mdcli_destroy (mdcli_t **self_p);
+int      mdcli_send    (mdcli_t *self, char *service, zmsg_t **request_p);
+zmsg_t  *mdcli_recv    (mdcli_t *self);
+</pre><p>It's literally a few minutes' work to refactor the synchronous client API to become asynchronous:</p><div class="example"><a id="mdcliapi2-c"></a><p class="title"><strong>Example 4.50. Majordomo asynchronous client API (mdcliapi2.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  mdcliapi2 class - Majordomo Protocol Client API
+//  Implements the MDP/Worker spec at http://rfc.zeromq.org/spec:7.
+
+#include "mdcliapi2.h"
+
+//  Structure of our class
+//  We access these properties only via class methods
+
+struct _mdcli_t {
+    zctx_t *ctx;                //  Our context
+    char *broker;
+    void *client;               //  Socket to broker
+    int verbose;                //  Print activity to stdout
+    int timeout;                //  Request timeout
+};
+
+//  Connect or reconnect to broker. In this asynchronous class we use a
+//  DEALER socket instead of a REQ socket; this lets us send any number
+//  of requests without waiting for a reply.
+
+void s_mdcli_connect_to_broker (mdcli_t *self)
+{
+    if (self-&gt;client)
+        zsocket_destroy (self-&gt;ctx, self-&gt;client);
+    self-&gt;client = zsocket_new (self-&gt;ctx, ZMQ_DEALER);
+    zmq_connect (self-&gt;client, self-&gt;broker);
+    if (self-&gt;verbose)
+        zclock_log ("I: connecting to broker at %s...", self-&gt;broker);
+}
+
+//  The constructor and destructor are the same as in mdcliapi, except
+//  we don't do retries, so there's no retries property.
+...
+...
+</pre></div></div><br class="example-break" /><p>The differences are:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>We use a DEALER socket instead of REQ, so we emulate REQ with an empty delimiter frame before each request and each response.</p></li><li class="listitem"><p>We don't retry requests; if the application needs to retry, it can do this itself.</p></li><li class="listitem"><p>We break the synchronous <code class="literal">send</code> method into separate <code class="literal">send</code> and <code class="literal">recv</code> methods.</p></li><li class="listitem"><p>The <code class="literal">send</code> method is asynchronous and returns immediately after sending. The caller can thus send a number of messages before getting a response.</p></li><li class="listitem"><p>The <code class="literal">recv</code> method waits for (with a timeout) one response and returns that to the caller.</p></li></ul></div><p>And here's the corresponding client test program, which sends 100,000 messages and then receives 100,000 back:</p><div class="example"><a id="mdclient2-c"></a><p class="title"><strong>Example 4.51. Majordomo client application (mdclient2.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Majordomo Protocol client example - asynchronous
+//  Uses the mdcli API to hide all MDP aspects
+
+//  Lets us build this source without creating a library
+#include "mdcliapi2.c"
+
+int main (int argc, char *argv [])
+{
+    int verbose = (argc &gt; 1 &amp;&amp; streq (argv [1], "-v"));
+    mdcli_t *session = mdcli_new ("tcp://localhost:5555", verbose);
+
+    int count;
+    for (count = 0; count &lt; 100000; count++) {
+        zmsg_t *request = zmsg_new ();
+        zmsg_pushstr (request, "Hello world");
+        mdcli_send (session, "echo", &amp;request);
+    }
+    for (count = 0; count &lt; 100000; count++) {
+        zmsg_t *reply = mdcli_recv (session);
+        if (reply)
+            zmsg_destroy (&amp;reply);
+        else
+            break;              //  Interrupted by Ctrl-C
+    }
+    printf ("%d replies received\n", count);
+    mdcli_destroy (&amp;session);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>The broker and worker are unchanged because we've not modified the protocol at all. We see an immediate improvement in performance. Here's the synchronous client chugging through 100K request-reply cycles:</p><pre class="screen">$ time mdclient
+100000 requests/replies processed
+
+real    0m14.088s
+user    0m1.310s
+sys     0m2.670s
+</pre><p>And here's the asynchronous client, with a single worker:</p><pre class="screen">$ time mdclient2
+100000 replies received
+
+real    0m8.730s
+user    0m0.920s
+sys     0m1.550s
+</pre><p>Twice as fast. Not bad, but let's fire up 10 workers and see how it handles the traffic</p><pre class="screen">$ time mdclient2
+100000 replies received
+
+real    0m3.863s
+user    0m0.730s
+sys     0m0.470s
+</pre><p>It isn't fully asynchronous because workers get their messages on a strict last-used basis. But it will scale better with more workers. On my PC, after eight or so workers, it doesn't get any faster. Four cores only stretches so far. But we got a 4x improvement in throughput with just a few minutes' work. The broker is still unoptimized. It spends most of its time copying message frames around, instead of doing zero-copy, which it could. But we're getting 25K reliable request/reply calls a second, with pretty low effort.</p><p>However, the asynchronous Majordomo pattern isn't all roses. It has a fundamental weakness, namely that it cannot survive a broker crash without more work. If you look at the <code class="literal">mdcliapi2</code> code you'll see it does not attempt to reconnect after a failure. A proper reconnect would require the following:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>A number on every request and a matching number on every reply, which would ideally require a change to the protocol to enforce.</p></li><li class="listitem"><p>Tracking and holding onto all outstanding requests in the client API, i.e., those for which no reply has yet been received.</p></li><li class="listitem"><p>In case of failover, for the client API to <span class="emphasis"><em>resend</em></span> all outstanding requests to the broker.</p></li></ul></div><p>It's not a deal breaker, but it does show that performance often means complexity. Is this worth doing for Majordomo? It depends on your use case. For a name lookup service you call once per session, no. For a web frontend serving thousands of clients, probably yes.</p></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch04s08.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch04.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch04s10.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Service-Oriented Reliable Queuing (Majordomo Pattern) </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Service Discovery</td></tr></table></div></body></html>

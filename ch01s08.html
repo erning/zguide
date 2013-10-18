@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>分布式处理</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch01.html" title="Chapter 1. ØMQ基础" /><link rel="prev" href="ch01s07.html" title="让消息流动起来" /><link rel="next" href="ch01s09.html" title="使用ØMQ编程" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">分布式处理</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch01s07.html">Prev</a> </td><th width="60%" align="center">Chapter 1. ØMQ基础</th><td width="20%" align="right"> <a accesskey="n" href="ch01s09.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="分布式处理"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp18997184"></a>分布式处理</h2></div></div></div><div class="figure"><a id="figure-5"></a><p class="title"><strong>Figure 1.4. Parallel Pipeline</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig5.png" alt="Parallel Pipeline" /></div></div></div><br class="figure-break" /><p>As a final example (you are surely getting tired of juicy code and want to delve back into philological discussions about comparative abstractive norms), let's do a little supercomputing. Then coffee. Our supercomputing application is a fairly typical parallel processing model<a class="xref" href="ch01s08.html#figure-6" title="Figure 1.5. Fair Queuing">Figure 1.5, “Fair Queuing”</a>. We have:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>任务分发器会生成大量可以并行计算的任务；</p></li><li class="listitem"><p>有一组worker会处理这些任务；</p></li><li class="listitem"><p>结果收集器会在末端接收所有worker的处理结果，进行汇总。</p></li></ul></div><p>现实中，worker可能散落在不同的计算机中，利用GPU（图像处理单元）进行复杂计算。下面是任务分发器的代码，它会生成100个任务，任务内容是让收到的worker延迟若干毫秒。</p><div class="example"><a id="taskvent-c"></a><p class="title"><strong>Example 1.9. Parallel task ventilator (taskvent.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Task ventilator
+//  Binds PUSH socket to tcp://localhost:5557
+//  Sends batch of tasks to workers via that socket
+
+#include "zhelpers.h"
+
+int main (void) 
+{
+    void *context = zmq_ctx_new ();
+
+    //  Socket to send messages on
+    void *sender = zmq_socket (context, ZMQ_PUSH);
+    zmq_bind (sender, "tcp://*:5557");
+
+    //  Socket to send start of batch message on
+    void *sink = zmq_socket (context, ZMQ_PUSH);
+    zmq_connect (sink, "tcp://localhost:5558");
+
+    printf ("Press Enter when the workers are ready: ");
+    getchar ();
+    printf ("Sending tasks to workers...\n");
+
+    //  The first message is "0" and signals start of batch
+    s_send (sink, "0");
+
+    //  Initialize random number generator
+    srandom ((unsigned) time (NULL));
+
+    //  Send 100 tasks
+    int task_nbr;
+    int total_msec = 0;     //  Total expected cost in msecs
+    for (task_nbr = 0; task_nbr &lt; 100; task_nbr++) {
+        int workload;
+        //  Random workload from 1 to 100msecs
+        workload = randof (100) + 1;
+        total_msec += workload;
+        char string [10];
+        sprintf (string, "%d", workload);
+        s_send (sender, string);
+    }
+    printf ("Total expected cost: %d msec\n", total_msec);
+
+    zmq_close (sink);
+    zmq_close (sender);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>下面是worker的代码，它接受信息并延迟指定的毫秒数，并发送执行完毕的信号：</p><div class="example"><a id="taskwork-c"></a><p class="title"><strong>Example 1.10. Parallel task worker (taskwork.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Task worker
+//  Connects PULL socket to tcp://localhost:5557
+//  Collects workloads from ventilator via that socket
+//  Connects PUSH socket to tcp://localhost:5558
+//  Sends results to sink via that socket
+
+#include "zhelpers.h"
+
+int main (void) 
+{
+    //  Socket to receive messages on
+    void *context = zmq_ctx_new ();
+    void *receiver = zmq_socket (context, ZMQ_PULL);
+    zmq_connect (receiver, "tcp://localhost:5557");
+
+    //  Socket to send messages to
+    void *sender = zmq_socket (context, ZMQ_PUSH);
+    zmq_connect (sender, "tcp://localhost:5558");
+
+    //  Process tasks forever
+    while (1) {
+        char *string = s_recv (receiver);
+        printf ("%s.", string);     //  Show progress
+        fflush (stdout);
+        s_sleep (atoi (string));    //  Do the work
+        free (string);
+        s_send (sender, "");        //  Send results to sink
+    }
+    zmq_close (receiver);
+    zmq_close (sender);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>下面是结果收集器的代码。它会收集100个处理结果，并计算总的执行时间，让我们由此判别任务是否是并行计算的。</p><div class="example"><a id="tasksink-c"></a><p class="title"><strong>Example 1.11. Parallel task sink (tasksink.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Task sink
+//  Binds PULL socket to tcp://localhost:5558
+//  Collects results from workers via that socket
+
+#include "zhelpers.h"
+
+int main (void) 
+{
+    //  Prepare our context and socket
+    void *context = zmq_ctx_new ();
+    void *receiver = zmq_socket (context, ZMQ_PULL);
+    zmq_bind (receiver, "tcp://*:5558");
+
+    //  Wait for start of batch
+    char *string = s_recv (receiver);
+    free (string);
+
+    //  Start our clock now
+    int64_t start_time = s_clock ();
+
+    //  Process 100 confirmations
+    int task_nbr;
+    for (task_nbr = 0; task_nbr &lt; 100; task_nbr++) {
+        char *string = s_recv (receiver);
+        free (string);
+        if ((task_nbr / 10) * 10 == task_nbr)
+            printf (":");
+        else
+            printf (".");
+        fflush (stdout);
+    }
+    //  Calculate and report duration of batch
+    printf ("Total elapsed time: %d msec\n", 
+        (int) (s_clock () - start_time));
+
+    zmq_close (receiver);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>一组任务的平均执行时间在5秒左右，以下是分别开始1个、2个、4个worker时的执行结果：</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>1 worker: total elapsed time: 5034 msecs.</p></li><li class="listitem"><p>2 workers: total elapsed time: 2421 msecs.</p></li><li class="listitem"><p>4 workers: total elapsed time: 1018 msecs.</p></li></ul></div><p>关于这段代码的几个细节：</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>worker上游和任务分发器相连，下游和结果收集器相连，这就意味着你可以开启任意多个worker。但若worker是绑定至端点的，而非连接至端点，那我们就需要准备更多的端点，并配置任务分发器和结果收集器。所以说，任务分发器和结果收集器是这个网络结构中较为<span class="emphasis"><em>稳定</em></span>的部分，因此应该由它们绑定至端点，而非worker，因为它们较为<span class="emphasis"><em>动态</em></span>。</p></li><li class="listitem"><p>我们需要做一些同步的工作，等待worker全部启动之后再分发任务。这点在ØMQ中很重要，且不易解决。连接套接字的动作会耗费一定的时间，因此当第一个worker连接成功时，它会一下收到很多任务。所以说，如果我们不进行同步，那这些任务根本就不会被并行地执行。你可以自己试验一下。</p></li><li class="listitem"><p>任务分发器使用PUSH套接字向worker均匀地分发任务（假设所有的worker都已经连接上了），这种机制称为<span class="emphasis"><em>负载均衡</em></span>，以后我们会见得更多。</p></li><li class="listitem"><p>结果收集器的PULL套接字会均匀地从worker处收集消息，这种机制称为<span class="emphasis"><em>公平队列</em></span><a class="xref" href="ch01s08.html#figure-6" title="Figure 1.5. Fair Queuing">Figure 1.5, “Fair Queuing”</a>：</p></li></ul></div><div class="figure"><a id="figure-6"></a><p class="title"><strong>Figure 1.5. Fair Queuing</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig6.png" alt="Fair Queuing" /></div></div></div><br class="figure-break" /><p>管道模式也会出现慢连接的情况，让人误以为PUSH套接字没有进行负载均衡。如果你的程序中某个worker接收到了更多的请求，那是因为它的PULL套接字连接得比较快，从而在别的worker连接之前获取了额外的消息。</p><p>If you want proper load balancing, you probably want to look at the The load balancing pattern in Advanced Request-Reply Patterns<a class="xref" href="ch03.html" title="Chapter 3. Advanced Request-Reply Patterns">Chapter 3, <em>Advanced Request-Reply Patterns</em></a>.</p></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch01s07.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch01.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch01s09.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">让消息流动起来 </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> 使用ØMQ编程</td></tr></table></div></body></html>

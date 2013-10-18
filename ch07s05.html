@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>State Machines</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch07.html" title="Chapter 7. Advanced Architecture using ØMQ" /><link rel="prev" href="ch07s04.html" title="Transferring Files" /><link rel="next" href="ch07s06.html" title="Authentication Using SASL" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">State Machines</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch07s04.html">Prev</a> </td><th width="60%" align="center">Chapter 7. Advanced Architecture using ØMQ</th><td width="20%" align="right"> <a accesskey="n" href="ch07s06.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="State Machines"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp20997688"></a>State Machines</h2></div></div></div><p>Software engineers tend to think of (finite) state machines as a kind of intermediary interpreter. That is, you take a regular language and compile that into a state machine, then execute the state machine. The state machine itself is rarely visible to the developer: it's an internal representation--optimized, compressed, and bizarre.</p><p>However, it turns out that state machines are also valuable as a first-class modeling languages for protocol handlers, e.g., ØMQ clients and servers. ØMQ makes it rather easy to design protocols, but we've never defined a good pattern for writing those clients and servers properly.</p><p>A protocol has at least two levels:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>How we represent individual messages on the wire.</p></li><li class="listitem"><p>How messages flow between peers, and the significance of each message.</p></li></ul></div><p>We've seen in this chapter how to produce codecs that handle serialization. That's a good start. But if we leave the second job to developers, that gives them a lot of room to interpret. As we make more ambitious protocols (file transfer + heartbeating + credit + authentication), it becomes less and less sane to try to implement clients and servers by hand.</p><p>Yes, people do this almost systematically. But the costs are high, and they're avoidable. I'll explain how to model protocols using state machines, and how to generate neat and solid code from those models.</p><p>My experience with using state machines as a software construction tool dates to 1985 and my first real job making tools for application developers. In 1991, I turned that knowledge into a free software tool called Libero, which spat out executable state machines from a simple text model.</p><p>The thing about Libero's model was that it was readable. That is, you described your program logic as named states, each accepting a set of events, each doing some real work. The resulting state machine hooked into your application code, driving it like a boss.</p><p>Libero was charmingly good at its job, fluent in many languages, and modestly popular given the enigmatic nature of state machines. We used Libero in anger in dozens of large distributed applications, one of which was finally switched off in 2011 after 20 years of operation. State-machine driven code construction worked so well that it's somewhat impressive that this approach never hit the mainstream of software engineering.</p><p>So in this section I'm going to explain Libero's model, and demonstrate how to use it to generate ØMQ clients and servers. We'll use GSL again, but like I said, the principles are general and you can put together code generators using any scripting language.</p><p>As a worked example, let's see how to carry-on a stateful dialog with a peer on a ROUTER socket. We'll develop the server using a state machine (and the client by hand). We have a simple protocol that I'll call "NOM". I'm using the oh-so-very-serious <a class="ulink" href="http://unprotocols.org/blog:2" target="_top">keywords for unprotocols</a> proposal:</p><pre class="screen">nom-protocol    = open-peering *use-peering
+
+open-peering    = C:OHAI ( S:OHAI-OK / S:WTF )
+
+use-peering     = C:ICANHAZ
+                / S:CHEEZBURGER
+                / C:HUGZ S:HUGZ-OK
+                / S:HUGZ C:HUGZ-OK
+</pre><p>I've not found a quick way to explain the true nature of state machine programming. In my experience, it invariably takes a few days of practice. After three or four days' exposure to the idea, there is a near-audible "click!" as something in the brain connects all the pieces together. We'll make it concrete by looking at the state machine for our NOM server.</p><p>A useful thing about state machines is that you can read them state by state. Each state has a unique descriptive name and one or more <span class="emphasis"><em>events</em></span>, which we list in any order. For each event, we perform zero or more <span class="emphasis"><em>actions</em></span> and we then move to a <span class="emphasis"><em>next state</em></span> (or stay in the same state).</p><p>In a ØMQ protocol server, we have a state machine instance <span class="emphasis"><em>per client</em></span>. That sounds complex but it isn't, as we'll see. We describe our first state, <code class="literal">Start</code>, as having one valid event: <code class="literal">OHAI</code>. We check the user's credentials and then arrive in the Authenticated state<a class="xref" href="ch07s05.html#figure-64" title="Figure 7.1. The Start State">Figure 7.1, “The Start State”</a>.</p><div class="figure"><a id="figure-64"></a><p class="title"><strong>Figure 7.1. The Start State</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig64.png" alt="The Start State" /></div></div></div><br class="figure-break" /><p>The <code class="literal">Check Credentials</code> action produces either an <code class="literal">ok</code> or an <code class="literal">error</code> event. It's in the Authenticated state that we handle these two possible events by sending an appropriate reply back to the client<a class="xref" href="ch07s05.html#figure-65" title="Figure 7.2. The Authenticated State">Figure 7.2, “The Authenticated State”</a>. If authentication failed, we return to the <code class="literal">Start</code> state where the client can try again.</p><div class="figure"><a id="figure-65"></a><p class="title"><strong>Figure 7.2. The Authenticated State</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig65.png" alt="The Authenticated State" /></div></div></div><br class="figure-break" /><p>When authentication has succeeded, we arrive in the Ready state. Here we have three possible events: an ICANHAZ or HUGZ message from the client, or a heartbeat timer event<a class="xref" href="ch07s05.html#figure-66" title="Figure 7.3. The Ready State">Figure 7.3, “The Ready State”</a>.</p><div class="figure"><a id="figure-66"></a><p class="title"><strong>Figure 7.3. The Ready State</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig66.png" alt="The Ready State" /></div></div></div><br class="figure-break" /><p>There are a few more things about this state machine model that are worth knowing:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Events in upper case (like "HUGZ") are <span class="emphasis"><em>external events</em></span> that come from the client as messages.</p></li><li class="listitem"><p>Events in lower case (like "heartbeat") are <span class="emphasis"><em>internal events</em></span>, produced by code in the server.</p></li><li class="listitem"><p>The "Send SOMETHING" actions are shorthand for sending a specific reply back to the client.</p></li><li class="listitem"><p>Events that aren't defined in a particular state are silently ignored.</p></li></ul></div><p>Now, the original source for these pretty pictures is an XML model:</p><pre class="screen">&lt;class name = "nom_server" script = "server_c"&gt;
+
+&lt;state name = "start"&gt;
+    &lt;event name = "OHAI" next = "authenticated"&gt;
+        &lt;action name = "check credentials" /&gt;
+    &lt;/event&gt;
+&lt;/state&gt;
+
+&lt;state name = "authenticated"&gt;
+    &lt;event name = "ok" next = "ready"&gt;
+        &lt;action name = "send" message ="OHAI-OK" /&gt;
+    &lt;/event&gt;
+    &lt;event name = "error" next = "start"&gt;
+        &lt;action name = "send" message = "WTF" /&gt;
+    &lt;/event&gt;
+&lt;/state&gt;
+
+&lt;state name = "ready"&gt;
+    &lt;event name = "ICANHAZ"&gt;
+        &lt;action name = "send" message = "CHEEZBURGER" /&gt;
+    &lt;/event&gt;
+    &lt;event name = "HUGZ"&gt;
+        &lt;action name = "send" message = "HUGZ-OK" /&gt;
+    &lt;/event&gt;
+    &lt;event name = "heartbeat"&gt;
+        &lt;action name = "send" message = "HUGZ" /&gt;
+    &lt;/event&gt;
+&lt;/state&gt;
+&lt;/class&gt;
+</pre><p>The code generator is in <code class="literal">examples/models/server_c.gsl</code>. It is a fairly complete tool that I'll use and expand for more serious work later. It generates:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>A server class in C (<code class="literal">nom_server.c</code>, <code class="literal">nom_server.h</code>) that implements the whole protocol flow.</p></li><li class="listitem"><p>A selftest method that runs the selftest steps listed in the XML file.</p></li><li class="listitem"><p>Documentation in the form of graphics (the pretty pictures).</p></li></ul></div><p>Here's a simple main program that starts the generated NOM server:</p><pre class="programlisting">
+#include "czmq.h"
+#include "nom_server.h"
+
+int main (int argc, char *argv [])
+{
+    printf ("Starting NOM protocol server on port 5670...\n");
+    nom_server_t *server = nom_server_new ();
+    nom_server_bind (server, "tcp://*:5670");
+    nom_server_wait (server);
+    nom_server_destroy (&amp;server);
+    return 0;
+}
+</pre><p>The generated nom_server class is a fairly classic model. It accepts client messages on a ROUTER socket, so the first frame on every request is the client's connection identity. The server manages a set of clients, each with state. As messages arrive, it feeds these as <span class="emphasis"><em>events</em></span> to the state machine. Here's the core of the state machine, as a mix of GSL commands and the C code we intend to generate:</p><pre class="programlisting">
+client_execute (client_t *self, int event)
+{
+    self-&gt;next_event = event;
+    while (self-&gt;next_event) {
+        self-&gt;event = self-&gt;next_event;
+        self-&gt;next_event = 0;
+        switch (self-&gt;state) {
+.for class.state
+            case $(name:c)_state:
+.   for event
+.       if index () &gt; 1
+                else
+.       endif
+                if (self-&gt;event == $(name:c)_event) {
+.       for action
+.           if name = "send"
+                    zmsg_addstr (self-&gt;reply, "$(message:)");
+.           else
+                $(name:c)_action (self);
+.           endif
+.       endfor
+.       if defined (event.next)
+                    self-&gt;state = $(next:c)_state;
+.       endif
+                }
+.   endfor
+                break;
+.endfor
+        }
+        if (zmsg_size (self-&gt;reply) &gt; 1) {
+            zmsg_send (&amp;self-&gt;reply, self-&gt;router);
+            self-&gt;reply = zmsg_new ();
+            zmsg_add (self-&gt;reply, zframe_dup (self-&gt;address));
+        }
+    }
+}
+</pre><p>Each client is held as an object with various properties, including the variables we need to represent a state machine instance:</p><pre class="programlisting">
+event_t next_event;         //  Next event
+state_t state;              //  Current state
+event_t event;              //  Current event
+</pre><p>You will see by now that we are generating technically-perfect code that has the precise design and shape we want. The only clue that the <code class="literal">nom_server</code> class isn't handwritten is that the code is <span class="emphasis"><em>too good</em></span>. People who complain that code generators produce poor code are accustomed to poor code generators. It is trivial to extend our model as we need it. For example, here's how we generate the selftest code.</p><p>First, we add a "selftest" item to the state machine and write our tests. We're not using any XML grammar or validation so it really is just a matter of opening the editor and adding half-a-dozen lines of text:</p><pre class="screen">&lt;selftest&gt;
+    &lt;step send = "OHAI" body = "Sleepy" recv = "WTF" /&gt;
+    &lt;step send = "OHAI" body = "Joe" recv = "OHAI-OK" /&gt;
+    &lt;step send = "ICANHAZ" recv = "CHEEZBURGER" /&gt;
+    &lt;step send = "HUGZ" recv = "HUGZ-OK" /&gt;
+    &lt;step recv = "HUGZ" /&gt;
+&lt;/selftest&gt;
+</pre><p>Designing on the fly, I decided that "send" and "recv" were a nice way to express "send this request, then expect this reply". Here's the GSL code that turns this model into real code:</p><pre class="screen">.for class-&gt;selftest.step
+.   if defined (send)
+    msg = zmsg_new ();
+    zmsg_addstr (msg, "$(send:)");
+.       if defined (body)
+    zmsg_addstr (msg, "$(body:)");
+.       endif
+    zmsg_send (&amp;msg, dealer);
+
+.   endif
+.   if defined (recv)
+    msg = zmsg_recv (dealer);
+    assert (msg);
+    command = zmsg_popstr (msg);
+    assert (streq (command, "$(recv:)"));
+    free (command);
+    zmsg_destroy (&amp;msg);
+
+.   endif
+.endfor
+</pre><p>Finally, one of the more tricky but absolutely essential parts of any state machine generator is <span class="emphasis"><em>how do I plug this into my own code?</em></span> As a minimal example for this exercise I wanted to implement the "check credentials" action by accepting all OHAIs from my friend Joe (Hi Joe!) and reject everyone else's OHAIs. After some thought, I decided to grab code directly from the state machine model, i.e., embed action bodies in the XML file. So in <code class="literal">nom_server.xml</code>, you'll see this:</p><pre class="screen">&lt;action name = "check credentials"&gt;
+    char *body = zmsg_popstr (self-&gt;request);
+    if (body &amp;&amp; streq (body, "Joe"))
+        self-&gt;next_event = ok_event;
+    else
+        self-&gt;next_event = error_event;
+    free (body);
+&lt;/action&gt;
+</pre><p>And the code generator grabs that C code and inserts it into the generated <code class="literal">nom_server.c</code> file:</p><pre class="screen">.for class.action
+static void
+$(name:c)_action (client_t *self) {
+$(string.trim (.):)
+}
+.endfor
+</pre><p>And now we have something quite elegant: a single source file that describes my server state machine and also contains the native implementations for my actions. A nice mix of high-level and low-level that is about 90% smaller than the C code.</p><p>Beware, as your head spins with notions of all the amazing things you could produce with such leverage. While this approach gives you real power, it also moves you away from your peers, and if you go too far, you'll find yourself working alone.</p><p>By the way, this simple little state machine design exposes just three variables to our custom code:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p><code class="literal">self-&gt;next_event</code></p></li><li class="listitem"><p><code class="literal">self-&gt;request</code></p></li><li class="listitem"><p><code class="literal">self-&gt;reply</code></p></li></ul></div><p>In the Libero state machine model, there are a few more concepts that we've not used here, but which we will need when we write larger state machines:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Exceptions, which lets us write terser state machines. When an action raises an exception, further processing on the event stops. The state machine can then define how to handle exception events.</p></li><li class="listitem"><p>The <code class="literal">Defaults</code> state, where we can define default handling for events (especially useful for exception events).</p></li></ul></div></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch07s04.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch07.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch07s06.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Transferring Files </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Authentication Using SASL</td></tr></table></div></body></html>

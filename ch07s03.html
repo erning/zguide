@@ -1,0 +1,178 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Serializing Your Data</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch07.html" title="Chapter 7. Advanced Architecture using ØMQ" /><link rel="prev" href="ch07s02.html" title="Unprotocols" /><link rel="next" href="ch07s04.html" title="Transferring Files" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Serializing Your Data</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch07s02.html">Prev</a> </td><th width="60%" align="center">Chapter 7. Advanced Architecture using ØMQ</th><td width="20%" align="right"> <a accesskey="n" href="ch07s04.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Serializing Your Data"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp20892880"></a>Serializing Your Data</h2></div></div></div><p>When we start to design a protocol, one of the first questions we face is how we encode data on the wire. There is no universal answer. There are a half-dozen different ways to serialize data, each with pros and cons. We'll explore some of these.</p><div class="sect2" title="Abstraction Level"><div class="titlepage"><div><div><h3 class="title"><a id="idp20893648"></a>Abstraction Level</h3></div></div></div><p>Before looking at how to put data onto the wire, it's worth asking what data we actually want to exchange between applications. If we don't use any abstraction, we literally serialize and deserialize our internal state. That is, the objects and structures we use to implement our functionality.</p><p>Putting internal state onto the wire is however a really bad idea. It's like exposing internal state in an API. When you do this, you are hard-coding your implementation decisions into your protocols. You are also going to produce protocols that are significantly more complex than they need to be.</p><p>It's perhaps the main reason so many older protocols and APIs are so complex: their designers did not think about how to abstract them into simpler concepts. There is of course no guarantee than an abstraction will be <span class="emphasis"><em>simpler</em></span>; that's where the hard work comes in.</p><p>A good protocol or API abstraction encapsulates natural patterns of use, and gives them name and properties that are predictable and regular. It chooses sensible defaults so that the main use cases can be specified minimally. It aims to be simple for the simple cases, and expressive for the rarer complex cases. It does not make any statements or assumptions about the internal implementation unless that is absolutely needed for interoperability.</p></div><div class="sect2" title="ØMQ Framing"><div class="titlepage"><div><div><h3 class="title"><a id="idp20896328"></a>ØMQ Framing</h3></div></div></div><p>The simplest and most widely used serialization format for ØMQ applications is ØMQ's own multipart framing. For example, here is how the <a class="ulink" href="http://rfc.zeromq.org/spec:7" target="_top">Majordomo Protocol</a> defines a request:</p><pre class="screen">Frame 0: Empty frame
+Frame 1: "MDPW01" (six bytes, representing MDP/Worker v0.1)
+Frame 2: 0x02 (one byte, representing REQUEST)
+Frame 3: Client address (envelope stack)
+Frame 4: Empty (zero bytes, envelope delimiter)
+Frames 5+: Request body (opaque binary)
+</pre><p>To read and write this in code is easy, but this is a classic example of a control flow (the whole of MDP is really, as it's a chatty request-reply protocol). When we came to improve MDP for the second version, we had to change this framing. Excellent, we broke all existing implementations!</p><p>Backwards compatibility is hard, but using ØMQ framing for control flows <span class="emphasis"><em>does not help</em></span>. Here's how I should have designed this protocol if I'd followed my own advice (and I'll fix this in the next version). It's split into a Cheap part and a Nasty part, and uses the ØMQ framing to separate these:</p><pre class="screen">Frame 0: "MDP/2.0" for protocol name and version
+Frame 1: command header
+Frame 2: command body
+</pre><p>Where we'd expect to parse the command header in the various intermediaries (client API, broker, and worker API), and pass the command body untouched from application to application.</p></div><div class="sect2" title="Serialization Languages"><div class="titlepage"><div><div><h3 class="title"><a id="idp20900008"></a>Serialization Languages</h3></div></div></div><p>Serialization languages have their fashions. XML used to be big as in popular, then it got big as in over-engineered, and then it fell into the hands of "Enterprise Information Architects" and it's not been seen alive since. Today's XML is the epitome of "somewhere in that mess is small, elegant language trying to escape".</p><p>Still XML was way, way better than its predecessors, which included such monsters as the Standard Generalized Markup Language (SGML), which in turn was a cool breeze compared to mind-torturing beasts like EDIFACT. So the history of serialization languages seems to be of gradually emerging sanity, hidden by waves of revolting EIAs doing their best to hold onto their jobs.</p><p>JSON popped out of the JavaScript world as a quick-and-dirty "I'd rather resign than use XML here" way to throw data onto the wire and get it back again. JSON is just minimal XML expressed, sneakily, as JavaScript source code.</p><p>Here's a simple example of using JSON in a Cheap protocol:</p><pre class="screen">"protocol": {
+    "name": "MTL",
+    "version": 1
+},
+"virtual-host": "test-env"
+</pre><p>The same data in XML would be (XML forces us to invent a single top-level entity):</p><pre class="screen">&lt;command&gt;
+    &lt;protocol name = "MTL" version = "1" /&gt;
+    &lt;virtual-host&gt;test-env&lt;/virtual-host&gt;
+&lt;/command&gt;
+</pre><p>And here it is using plain-old HTTP-style headers:</p><pre class="screen">Protocol: MTL/1.0
+Virtual-host: test-env
+</pre><p>These are all pretty equivalent as long as you don't go overboard with validating parsers, schemas, and other "trust us, this is all for your own good" nonsense. A Cheap serialization language gives you space for experimentation for free ("ignore any elements/attributes/headers that you don't recognize"), and it's simple to write generic parsers that, for example, thunk a command into a hash table, or vice versa.</p><p>However, it's not all roses. While modern scripting languages support JSON and XML easily enough, older languages do not. If you use XML or JSON, you create nontrivial dependencies. It's also somewhat of a pain to work with tree-structured data in a language like C.</p><p>So you can drive your choice according to the languages for which you're aiming. If your universe is a scripting language, then go for JSON. If you are aiming to build protocols for wider system use, keep things simple for C developers and stick to HTTP-style headers.</p></div><div class="sect2" title="Serialization Libraries"><div class="titlepage"><div><div><h3 class="title"><a id="idp20905400"></a>Serialization Libraries</h3></div></div></div><p>The <code class="literal">msgpack.org</code> site says:</p><p>&gt;It's like JSON, but fast and small. MessagePack is an efficient binary serialization format. It lets you exchange data among multiple languages like JSON, but it's faster and smaller. For example, small integers (like flags or error code) are encoded into a single byte, and typical short strings only require an extra byte in addition to the strings themselves.</p><p>I'm going to make the perhaps unpopular claim that "fast and small" are features that solve non-problems. The only real problem that serialization libraries solve is, as far as I can tell, the need to document the message contracts and actually serialize data to and from the wire.</p><p>Let's start by debunking "fast and small". It's based on a two-part argument. First, that making your messages smaller and reducing CPU cost for encoding and decoding will make a significant difference to your application's performance. Second, that this equally valid across-the-board to all messages.</p><p>But most real applications tend to fall into one of two categories. Either the speed of serialization and size of encoding is marginal compared to other costs, such as database access or application code performance. Or, network performance really is critical, and then all significant costs occur in a few specific message types.</p><p>Thus, aiming for "fast and small" across the board is a false optimization. You neither get the easy flexibility of Cheap for your infrequent control flows, nor do you get the brutal efficiency of Nasty for your high-volume data flows. Worse, the assumption that all messages are equal in some way can corrupt your protocol design. Cheap or Nasty isn't only about serialization strategies, it's also about synchronous versus asynchronous, error handling and the cost of change.</p><p>My experience is that most performance problems in message-based applications can be solved by (a) improving the application itself and (b) hand-optimizing the high-volume data flows. And to hand-optimize your most critical data flows, you need to cheat; to learn exploit facts about your data, something general purpose serializers cannot do.</p><p>Now let's address documentation and the need to write our contracts explicitly and formally, rather than only in code. This is a valid problem to solve, indeed one of the main ones if we're to build a long-lasting, large-scale message-based architecture.</p><p>Here is how we describe a typical message using the MessagePack interface definition language (IDL):</p><pre class="screen">message Person {
+  1: string surname
+  2: string firstname
+  3: optional string email
+}
+</pre><p>Now, the same message using the Google protocol buffers IDL:</p><pre class="screen">message Person {
+  required string surname = 1;
+  required string firstname = 2;
+  optional string email = 3;
+}
+</pre><p>It works, but in most practical cases wins you little over a serialization language backed by decent specifications written by hand or produced mechanically (we'll come to this). The price you'll pay is an extra dependency and quite probably, worse overall performance than if you used Cheap or Nasty.</p></div><div class="sect2" title="Handwritten Binary Serialization"><div class="titlepage"><div><div><h3 class="title"><a id="idp20911952"></a>Handwritten Binary Serialization</h3></div></div></div><p>As you'll gather from this book, my preferred language for systems programming is C (upgraded to C99, with a constructor/destructor API model and generic containers). There are two reasons I like this modernized C language. First, I'm too weak-minded to learn a big language like C++. Life just seems filled with more interesting things to understand. Second, I find that this specific level of manual control lets me produce better results, faster.</p><p>The point here isn't C versus C++, but the value of manual control for high-end professional users. It's no accident that the best cars, cameras, and espresso machines in the world have manual controls. That level of on-the-spot fine tuning often makes the difference between world class success, and being second best.</p><p>When you are really, truly concerned about the speed of serialization and/or the size of the result (often these contradict each other), you need handwritten binary serialization. In other words, let's hear it for Mr. Nasty!</p><p>Your basic process for writing an efficient Nasty encoder/decoder (codec) is:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Build representative data sets and test applications that can stress test your codec.</p></li><li class="listitem"><p>Write a first dumb version of the codec.</p></li><li class="listitem"><p>Test, measure, improve, and repeat until you run out of time and/or money.</p></li></ul></div><p>Here are some of the techniques we use to make our codecs better:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p><span class="emphasis"><em>Use a profiler.</em></span> There's simply no way to know what your code is doing until you've profiled it for function counts and for CPU cost per function. When you find your hot spots, fix them.</p></li><li class="listitem"><p><span class="emphasis"><em>Eliminate memory allocations.</em></span> The heap is very fast on a modern Linux kernel, but it's still the bottleneck in most naive codecs. On older kernels, the heap can be tragically slow. Use local variables (the stack) instead of the heap where you can.</p></li><li class="listitem"><p><span class="emphasis"><em>Test on different platforms and with different compilers and compiler options.</em></span> Apart from the heap, there are many other differences. You need to learn the main ones, and allow for them.</p></li><li class="listitem"><p><span class="emphasis"><em>Use state to compress better.</em></span> If you are concerned about codec performance, you are almost definitely sending the same kinds of data many times. There will be redundancy between instances of data. You can detect these and use that to compress (e.g., a short value that means "same as last time").</p></li><li class="listitem"><p><span class="emphasis"><em>Know your data.</em></span> The best compression techniques (in terms of CPU cost for compactness) require knowing about the data. For example, the techniques used to compress a word list, a video, and a stream of stock market data are all different.</p></li><li class="listitem"><p><span class="emphasis"><em>Be ready to break the rules.</em></span> Do you really need to encode integers in big-endian network byte order? x86 and ARM account for almost all modern CPUs, yet use little-endian (ARM is actually bi-endian but Android, like Windows and iOS, is little-endian).</p></li></ul></div></div><div class="sect2" title="Code Generation"><div class="titlepage"><div><div><h3 class="title"><a id="idp20919656"></a>Code Generation</h3></div></div></div><p>Reading the previous two sections, you might have wondered, "could I write my own IDL generator that was better than a general purpose one?" If this thought wandered into your mind, it probably left pretty soon after, chased by dark calculations about how much work that actually involved.</p><p>What if I told you of a way to build custom IDL generators cheaply and quickly? You can have a way to get perfectly documented contracts, code that is as evil and domain-specific as you need it to be, and all you need to do is sign away your soul (<span class="emphasis"><em>who ever really used that, am I right?</em></span>) just here...</p><p>At iMatix, until a few years ago, we used code generation to build ever larger and more ambitious systems until we decided the technology (GSL) was too dangerous for common use, and we sealed the archive and locked it with heavy chains in a deep dungeon. We actually posted it on GitHub. If you want to try the examples that are coming up, grab <a class="ulink" href="https://github.com/imatix/gsl" target="_top">the repository</a> and build yourself a <code class="literal">gsl</code> command. Typing "make" in the src subdirectory should do it (and if you're that guy who loves Windows, I'm sure you'll send a patch with project files).</p><p>This section isn't really about GSL at all, but about a useful and little-known trick that's useful for ambitious architects who want to scale themselves, as well as their work. Once you learn the trick, you can whip up your own code generators in a short time. The code generators most software engineers know about come with a single hard-coded model. For instance, Ragel "compiles executable finite state machines from regular languages", i.e., Ragel's model is a regular language. This certainly works for a good set of problems, but it's far from universal. How do you describe an API in Ragel? Or a project makefile? Or even a finite-state machine like the one we used to design the Binary Star pattern in Reliable Request-Reply Patterns<a class="xref" href="ch04.html" title="Chapter 4. Reliable Request-Reply Patterns">Chapter 4, <em>Reliable Request-Reply Patterns</em></a>?</p><p>All these would benefit from code generation, but there's no universal model. So the trick is to design your own models as you need them, and then make code generators as cheap compilers for that model. You need some experience in how to make good models, and you need a technology that makes it cheap to build custom code generators. A scripting language, like Perl and Python, is a good option. However, we actually built GSL specifically for this, and that's what I prefer.</p><p>Let's take a simple example that ties into what we already know. We'll see more extensive examples later, because I really do believe that code generation is crucial knowledge for large-scale work. In Reliable Request-Reply Patterns<a class="xref" href="ch04.html" title="Chapter 4. Reliable Request-Reply Patterns">Chapter 4, <em>Reliable Request-Reply Patterns</em></a>, we developed the <a class="ulink" href="http://rfc.zeromq.org/spec:7" target="_top">Majordomo Protocol (MDP)</a>, and wrote clients, brokers, and workers for that. Now could we generate those pieces mechanically, by building our own interface description language and code generators?</p><p>When we write a GSL model, we can use <span class="emphasis"><em>any</em></span> semantics we like, in other words we can invent domain-specific languages on the spot. I'll invent a couple--see if you can guess what they represent:</p><pre class="screen">slideshow
+    name = Cookery level 3
+    page
+        title = French Cuisine
+        item = Overview
+        item = The historical cuisine
+        item = The nouvelle cuisine
+        item = Why the French live longer
+    page
+        title = Overview
+        item = Soups and salads
+        item = Le plat principal
+        item = Béchamel and other sauces
+        item = Pastries, cakes, and quiches
+        item = Soufflé: cheese to strawberry
+</pre><p>How about this one:</p><pre class="screen">table
+    name = person
+    column
+        name = firstname
+        type = string
+    column
+        name = lastname
+        type = string
+    column
+        name = rating
+        type = integer
+</pre><p>We could compile the first into a presentation. The second, we could compile into SQL to create and work with a database table. So for this exercise, our domain language, our <span class="emphasis"><em>model</em></span>, consists of "classes" that contain "messages" that contain "fields" of various types. It's deliberately familiar. Here is the MDP client protocol:</p><pre class="screen">&lt;class name = "mdp_client"&gt;
+    MDP/Client
+    &lt;header&gt;
+        &lt;field name = "empty" type = "string" value = ""
+            &gt;Empty frame&lt;/field&gt;
+        &lt;field name = "protocol" type = "string" value = "MDPC01"
+            &gt;Protocol identifier&lt;/field&gt;
+    &lt;/header&gt;
+    &lt;message name = "request"&gt;
+        Client request to broker
+        &lt;field name = "service" type = "string"&gt;Service name&lt;/field&gt;
+        &lt;field name = "body" type = "frame"&gt;Request body&lt;/field&gt;
+    &lt;/message&gt;
+    &lt;message name = "reply"&gt;
+        Response back to client
+        &lt;field name = "service" type = "string"&gt;Service name&lt;/field&gt;
+        &lt;field name = "body" type = "frame"&gt;Response body&lt;/field&gt;
+    &lt;/message&gt;
+&lt;/class&gt;
+</pre><p>And here is the MDP worker protocol:</p><pre class="screen">&lt;class name = "mdp_worker"&gt;
+    MDP/Worker
+    &lt;header&gt;
+        &lt;field name = "empty" type = "string" value = ""
+            &gt;Empty frame&lt;/field&gt;
+        &lt;field name = "protocol" type = "string" value = "MDPW01"
+            &gt;Protocol identifier&lt;/field&gt;
+        &lt;field name = "id" type = "octet"&gt;Message identifier&lt;/field&gt;
+    &lt;/header&gt;
+    &lt;message name = "ready" id = "1"&gt;
+        Worker tells broker it is ready
+        &lt;field name = "service" type = "string"&gt;Service name&lt;/field&gt;
+    &lt;/message&gt;
+    &lt;message name = "request" id = "2"&gt;
+        Client request to broker
+        &lt;field name = "client" type = "frame"&gt;Client address&lt;/field&gt;
+        &lt;field name = "body" type = "frame"&gt;Request body&lt;/field&gt;
+    &lt;/message&gt;
+    &lt;message name = "reply" id = "3"&gt;
+        Worker returns reply to broker
+        &lt;field name = "client" type = "frame"&gt;Client address&lt;/field&gt;
+        &lt;field name = "body" type = "frame"&gt;Request body&lt;/field&gt;
+    &lt;/message&gt;
+    &lt;message name = "hearbeat" id = "4"&gt;
+        Either peer tells the other it's still alive
+    &lt;/message&gt;
+    &lt;message name = "disconnect" id = "5"&gt;
+        Either peer tells other the party is over
+    &lt;/message&gt;
+&lt;/class&gt;
+</pre><p>GSL uses XML as its modeling language. XML has a poor reputation, having been dragged through too many enterprise sewers to smell sweet, but it has some strong positives, as long as you keep it simple. Any way to write a self-describing hierarchy of items and attributes would work.</p><p>Now here is a short IDL generator written in GSL that turns our protocol models into documentation:</p><pre class="screen">.#  Trivial IDL generator (specs.gsl)
+.#
+.output "$(class.name).md"
+## The $(string.trim (class.?''):left) Protocol
+.for message
+.   frames = count (class-&gt;header.field) + count (field)
+
+A $(message.NAME) command consists of a multipart message of $(frames)
+frames:
+
+.   for class-&gt;header.field
+.       if name = "id"
+* Frame $(item ()): 0x$(message.id:%02x) (1 byte, $(message.NAME))
+.       else
+* Frame $(item ()): "$(value:)" ($(string.length ("$(value)")) \
+bytes, $(field.:))
+.       endif
+.   endfor
+.   index = count (class-&gt;header.field) + 1
+.   for field
+* Frame $(index): $(field.?'') \
+.       if type = "string"
+(printable string)
+.       elsif type = "frame"
+(opaque binary)
+.           index += 1
+.       else
+.           echo "E: unknown field type: $(type)"
+.       endif
+.       index += 1
+.   endfor
+.endfor
+</pre><p>The XML models and this script are in the subdirectory examples/models. To do the code generation, I give this command:</p><pre class="screen">gsl -script:specs mdp_client.xml mdp_worker.xml
+</pre><p>Here is the Markdown text we get for the worker protocol:</p><pre class="screen">## The MDP/Worker Protocol
+
+A READY command consists of a multipart message of 4 frames:
+
+* Frame 1: "" (0 bytes, Empty frame)
+* Frame 2: "MDPW01" (6 bytes, Protocol identifier)
+* Frame 3: 0x01 (1 byte, READY)
+* Frame 4: Service name (printable string)
+
+A REQUEST command consists of a multipart message of 5 frames:
+
+* Frame 1: "" (0 bytes, Empty frame)
+* Frame 2: "MDPW01" (6 bytes, Protocol identifier)
+* Frame 3: 0x02 (1 byte, REQUEST)
+* Frame 4: Client address (opaque binary)
+* Frame 6: Request body (opaque binary)
+
+A REPLY command consists of a multipart message of 5 frames:
+
+* Frame 1: "" (0 bytes, Empty frame)
+* Frame 2: "MDPW01" (6 bytes, Protocol identifier)
+* Frame 3: 0x03 (1 byte, REPLY)
+* Frame 4: Client address (opaque binary)
+* Frame 6: Request body (opaque binary)
+
+A HEARBEAT command consists of a multipart message of 3 frames:
+
+* Frame 1: "" (0 bytes, Empty frame)
+* Frame 2: "MDPW01" (6 bytes, Protocol identifier)
+* Frame 3: 0x04 (1 byte, HEARBEAT)
+
+A DISCONNECT command consists of a multipart message of 3 frames:
+
+* Frame 1: "" (0 bytes, Empty frame)
+* Frame 2: "MDPW01" (6 bytes, Protocol identifier)
+* Frame 3: 0x05 (1 byte, DISCONNECT)
+</pre><p>This, as you can see, is close to what I wrote by hand in the original spec. Now, if you have cloned the <code class="literal">zguide</code> repository and you are looking at the code in <code class="literal">examples/models</code>, you can generate the MDP client and worker codecs. We pass the same two models to a different code generator:</p><pre class="screen">gsl -script:codec_c mdp_client.xml mdp_worker.xml
+</pre><p>Which gives us <code class="literal">mdp_client</code> and <code class="literal">mdp_worker</code> classes. Actually MDP is so simple that it's barely worth the effort of writing the code generator. The profit comes when we want to change the protocol (which we did for the standalone Majordomo project). You modify the protocol, run the command, and out pops more perfect code.</p><p>The <code class="literal">codec_c.gsl</code> code generator is not short, but the resulting codecs are much better than the handwritten code I originally put together for Majordomo. For instance, the handwritten code had no error checking and would die if you passed it bogus messages.</p><p>I'm now going to explain the pros and cons of GSL-powered model-oriented code generation. Power does not come for free and one of the greatest traps in our business is the ability to invent concepts out of thin air. GSL makes this particularly easy, so it can be an equally dangerous tool.</p><p><span class="emphasis"><em>Do not invent concepts</em></span>. The job of a designer is to remove problems, not add features.</p><p>Firstly, I will lay out the advantages of model-oriented code generation:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>You can create near-perfect abstractions that map to your real world. So, our protocol model maps 100% to the "real world" of Majordomo. This would be impossible without the freedom to tune and change the model in any way.</p></li><li class="listitem"><p>You can develop these perfect models quickly and cheaply.</p></li><li class="listitem"><p>You can generate <span class="emphasis"><em>any</em></span> text output. From a single model, you can create documentation, code in any language, test tools--literally any output you can think of.</p></li><li class="listitem"><p>You can generate (and I mean this literally) <span class="emphasis"><em>perfect</em></span> output because it's cheap to improve your code generators to any level you want.</p></li><li class="listitem"><p>You get a single source that combines specifications and semantics.</p></li><li class="listitem"><p>You can leverage a small team to a massive size. At iMatix, we produced the million-line OpenAMQ messaging product out of perhaps 85K lines of input models, including the code generation scripts themselves.</p></li></ul></div><p>Now let's look at the disadvantages:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>You add tool dependencies to your project.</p></li><li class="listitem"><p>You may get carried away and create models for the pure joy of creating them.</p></li><li class="listitem"><p>You may alienate newcomers, who will see "strange stuff", from your work.</p></li><li class="listitem"><p>You may give people a strong excuse not to invest in your project.</p></li></ul></div><p>Cynically, model-oriented abuse works great in environments where you want to produce huge amounts of perfect code that you can maintain with little effort and which <span class="emphasis"><em>no one can ever take away from you.</em></span> Personally, I like to cross my rivers and move on. But if long-term job security is your thing, this is almost perfect.</p><p>So if you do use GSL and want to create open communities around your work, here is my advice:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Use it only where you would otherwise be writing tiresome code by hand.</p></li><li class="listitem"><p>Design natural models that are what people would expect to see.</p></li><li class="listitem"><p>Write the code by hand first so you know what to generate.</p></li><li class="listitem"><p>Do not overuse. Keep it simple! <span class="emphasis"><em>Do not get too meta!!</em></span></p></li><li class="listitem"><p>Introduce gradually into a project.</p></li><li class="listitem"><p>Put the generated code into your repositories.</p></li></ul></div><p>We're already using GSL in some projects around ØMQ. For example, the high-level C binding, CZMQ, uses GSL to generate the socket options class (<code class="literal">zsockopt</code>). A 300-line code generator turns 78 lines of XML model into 1,500 lines of perfect, but really boring code. That's a good win.</p></div></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch07s02.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch07.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch07s04.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Unprotocols </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Transferring Files</td></tr></table></div></body></html>

@@ -1,0 +1,277 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Transferring Files</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch07.html" title="Chapter 7. Advanced Architecture using ØMQ" /><link rel="prev" href="ch07s03.html" title="Serializing Your Data" /><link rel="next" href="ch07s05.html" title="State Machines" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Transferring Files</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch07s03.html">Prev</a> </td><th width="60%" align="center">Chapter 7. Advanced Architecture using ØMQ</th><td width="20%" align="right"> <a accesskey="n" href="ch07s05.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Transferring Files"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp20950192"></a>Transferring Files</h2></div></div></div><p>Let's take a break from the lecturing and get back to our first love and the reason for doing all of this: code.</p><p>"How do I send a file?" is a common question on the ØMQ mailing lists. This should not be surprising, because file transfer is perhaps the oldest and most obvious type of messaging. Sending files around networks has lots of use cases apart from annoying the copyright cartels. ØMQ is very good out of the box at sending events and tasks, but less good at sending files.</p><p>I've promised, for a year or two, to write a proper explanation. Here's a gratuitous piece of information to brighten your morning: the word "proper" comes from the archaic French <span class="emphasis"><em>propre</em></span>, which means "clean". The dark age English common folk, not being familiar with hot water and soap, changed the word to mean "foreign" or "upper-class", as in "that's proper food!", but later the word came to mean just "real", as in "that's a proper mess you've gotten us into!"</p><p>So, file transfer. There are several reasons you can't just pick up a random file, blindfold it, and shove it whole into a message. The most obvious reason being that despite decades of determined growth in RAM sizes (and who among us old-timers doesn't fondly remember saving up for that 1024-byte memory extension card?!), disk sizes obstinately remain much larger. Even if we could send a file with one instruction (say, using a system call like sendfile), we'd hit the reality that networks are not infinitely fast nor perfectly reliable. After trying to upload a large file several times on a slow flaky network (WiFi, anyone?), you'll realize that a proper file transfer protocol needs a way to recover from failures. That is, it needs a way to send only the part of a file that wasn't yet received.</p><p>Finally, after all this, if you build a proper file server, you'll notice that simply sending massive amounts of data to lots of clients creates that situation we like to call, in the technical parlance, "server went belly-up due to all available heap memory being eaten by a poorly designed application". A proper file transfer protocol needs to pay attention to memory use.</p><p>We'll solve these problems properly, one-by-one, which should hopefully get us to a good and proper file transfer protocol running over ØMQ. First, let's generate a 1GB test file with random data (real power-of-two-giga-like-Von-Neumman-intended, not the fake silicon ones the memory industry likes to sell):</p><pre class="screen">dd if=/dev/urandom of=testdata bs=1M count=1024
+</pre><p>This is large enough to be troublesome when we have lots of clients asking for the same file at once, and on many machines, 1GB is going to be too large to allocate in memory anyhow. As a base reference, let's measure how long it takes to copy this file from disk back to disk. This will tell us how much our file transfer protocol adds on top (including network costs):</p><pre class="screen">$ time cp testdata testdata2
+
+real    0m7.143s
+user    0m0.012s
+sys     0m1.188s
+</pre><p>The 4-figure precision is misleading; expect variations of 25% either way. This is just an "order of magnitude" measurement.</p><p>Here's our first cut at the code, where the client asks for the test data and the server just sends it, without stopping for breath, as a series of messages, where each message holds one <span class="emphasis"><em>chunk</em></span>:</p><div class="example"><a id="fileio1-c"></a><p class="title"><strong>Example 7.1. File transfer test, model 1 (fileio1.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  File Transfer model #1
+//  
+//  In which the server sends the entire file to the client in
+//  large chunks with no attempt at flow control.
+
+#include &lt;czmq.h&gt;
+#define CHUNK_SIZE  250000
+
+static void
+client_thread (void *args, zctx_t *ctx, void *pipe)
+{
+    void *dealer = zsocket_new (ctx, ZMQ_DEALER);
+    zsocket_connect (dealer, "tcp://127.0.0.1:6000");
+    
+    zstr_send (dealer, "fetch");
+    size_t total = 0;       //  Total bytes received
+    size_t chunks = 0;      //  Total chunks received
+    
+    while (true) {
+        zframe_t *frame = zframe_recv (dealer);
+        if (!frame)
+            break;              //  Shutting down, quit
+        chunks++;
+        size_t size = zframe_size (frame);
+        zframe_destroy (&amp;frame);
+        total += size;
+        if (size == 0)
+            break;              //  Whole file received
+    }
+    printf ("%zd chunks received, %zd bytes\n", chunks, total);
+    zstr_send (pipe, "OK");
+}
+</pre></div></div><br class="example-break" /><p>The server thread reads the file from disk in chunks, and sends each chunk to the client as a separate message. We only have one test file, so open that once and then serve it out as needed: 
+</p><div class="example"><a id="fileio1-c-1"></a><p class="title"><strong>Example 7.2. File transfer test, model 1 (fileio1.c) - File server thread</strong></p><div class="example-contents"><pre class="programlisting">
+
+static void
+server_thread (void *args, zctx_t *ctx, void *pipe)
+{
+    FILE *file = fopen ("testdata", "r");
+    assert (file);
+
+    void *router = zsocket_new (ctx, ZMQ_ROUTER);
+    //  Default HWM is 1000, which will drop messages here
+    //  because we send more than 1,000 chunks of test data,
+    //  so set an infinite HWM as a simple, stupid solution:
+    zsocket_set_hwm (router, 0);
+    zsocket_bind (router, "tcp://*:6000");
+    while (true) {
+        //  First frame in each message is the sender identity
+        zframe_t *identity = zframe_recv (router);
+        if (!identity)
+            break;              //  Shutting down, quit
+            
+        //  Second frame is "fetch" command
+        char *command = zstr_recv (router);
+        assert (streq (command, "fetch"));
+        free (command);
+
+        while (true) {
+            byte *data = malloc (CHUNK_SIZE);
+            assert (data);
+            size_t size = fread (data, 1, CHUNK_SIZE, file);
+            zframe_t *chunk = zframe_new (data, size);
+            zframe_send (&amp;identity, router, ZFRAME_REUSE + ZFRAME_MORE);
+            zframe_send (&amp;chunk, router, 0);
+            if (size == 0)
+                break;          //  Always end with a zero-size frame
+        }
+        zframe_destroy (&amp;identity);
+    }
+    fclose (file);
+}
+</pre></div></div><br class="example-break" /><p>The main task starts the client and server threads; it's easier to test this as a single process with threads, than as multiple processes: 
+</p><div class="example"><a id="fileio1-c-2"></a><p class="title"><strong>Example 7.3. File transfer test, model 1 (fileio1.c) - File main thread</strong></p><div class="example-contents"><pre class="programlisting">
+
+int main (void)
+{
+    //  Start child threads
+    zctx_t *ctx = zctx_new ();
+    zthread_fork (ctx, server_thread, NULL);
+    void *client =
+    zthread_fork (ctx, client_thread, NULL);
+    //  Loop until client tells us it's done
+    char *string = zstr_recv (client);
+    free (string);
+    //  Kill server thread
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>It's pretty simple, but we already run into a problem: if we send too much data to the ROUTER socket, we can easily overflow it. The simple but stupid solution is to put an infinite high-water mark on the socket. It's stupid because we now have no protection against exhausting the server's memory. Yet without an infinite HWM, we risk losing chunks of large files.</p><p>Try this: set the HWM to 1,000 (in ØMQ v3.x this is the default) and then reduce the chunk size to 100K so we send 10K chunks in one go. Run the test, and you'll see it never finishes. As the <code class="literal">zmq_socket()</code> man page says with cheerful brutality, for the ROUTER socket: "ZMQ_HWM option action: Drop".</p><p>We have to control the amount of data the server sends up-front. There's no point in it sending more than the network can handle. Let's try sending one chunk at a time. In this version of the protocol, the client will explicitly say, "Give me chunk N", and the server will fetch that specific chunk from disk and send it.</p><p>Here's the improved second model, where the client asks for one chunk at a time, and the server only sends one chunk for each request it gets from the client:</p><div class="example"><a id="fileio2-c"></a><p class="title"><strong>Example 7.4. File transfer test, model 2 (fileio2.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  File Transfer model #2
+//  
+//  In which the client requests each chunk individually, thus
+//  eliminating server queue overflows, but at a cost in speed.
+
+#include &lt;czmq.h&gt;
+#define CHUNK_SIZE  250000
+
+static void
+client_thread (void *args, zctx_t *ctx, void *pipe)
+{
+    void *dealer = zsocket_new (ctx, ZMQ_DEALER);
+    zsocket_set_hwm (dealer, 1);
+    zsocket_connect (dealer, "tcp://127.0.0.1:6000");
+
+    size_t total = 0;       //  Total bytes received
+    size_t chunks = 0;      //  Total chunks received
+
+    while (true) {
+        //  Ask for next chunk
+        zstr_sendm (dealer, "fetch");
+        zstr_sendm (dealer, "%ld", total);
+        zstr_send  (dealer, "%ld", CHUNK_SIZE);
+        
+        zframe_t *chunk = zframe_recv (dealer);
+        if (!chunk)
+            break;              //  Shutting down, quit
+        chunks++;
+        size_t size = zframe_size (chunk);
+        zframe_destroy (&amp;chunk);
+        total += size;
+        if (size &lt; CHUNK_SIZE)
+            break;              //  Last chunk received; exit
+    }
+    printf ("%zd chunks received, %zd bytes\n", chunks, total);
+    zstr_send (pipe, "OK");
+}
+</pre></div></div><br class="example-break" /><p>The server thread waits for a chunk request from a client, reads that chunk, and sends it back to the client: 
+</p><div class="example"><a id="fileio2-c-1"></a><p class="title"><strong>Example 7.5. File transfer test, model 2 (fileio2.c) - File server thread</strong></p><div class="example-contents"><pre class="programlisting">
+
+static void
+server_thread (void *args, zctx_t *ctx, void *pipe)
+{
+    FILE *file = fopen ("testdata", "r");
+    assert (file);
+
+    void *router = zsocket_new (ctx, ZMQ_ROUTER);
+    zsocket_set_hwm (router, 1);
+    zsocket_bind (router, "tcp://*:6000");
+    while (true) {
+        //  First frame in each message is the sender identity
+        zframe_t *identity = zframe_recv (router);
+        if (!identity)
+            break;              //  Shutting down, quit
+            
+        //  Second frame is "fetch" command
+        char *command = zstr_recv (router);
+        assert (streq (command, "fetch"));
+        free (command);
+
+        //  Third frame is chunk offset in file
+        char *offset_str = zstr_recv (router);
+        size_t offset = atoi (offset_str);
+        free (offset_str);
+
+        //  Fourth frame is maximum chunk size
+        char *chunksz_str = zstr_recv (router);
+        size_t chunksz = atoi (chunksz_str);
+        free (chunksz_str);
+
+        //  Read chunk of data from file
+        fseek (file, offset, SEEK_SET);
+        byte *data = malloc (chunksz);
+        assert (data);
+
+        //  Send resulting chunk to client
+        size_t size = fread (data, 1, chunksz, file);
+        zframe_t *chunk = zframe_new (data, size);
+        zframe_send (&amp;identity, router, ZFRAME_MORE);
+        zframe_send (&amp;chunk, router, 0);
+    }
+    fclose (file);
+}
+
+//  The main task is just the same as in the first model.
+...
+</pre></div></div><br class="example-break" /><p>It is much slower now, because of the to-and-fro chatting between client and server. We pay about 300 microseconds for each request-reply round-trip, on a local loop connection (client and server on the same box). It doesn't sound like much but it adds up quickly:</p><pre class="screen">$ time ./fileio1
+4296 chunks received, 1073741824 bytes
+
+real    0m0.669s
+user    0m0.056s
+sys     0m1.048s
+
+$ time ./fileio2
+4295 chunks received, 1073741824 bytes
+
+real    0m2.389s
+user    0m0.312s
+sys     0m2.136s
+</pre><p>There are two valuable lessons here. First, while request-reply is easy, it's also too slow for high-volume data flows. Paying that 300 microseconds once would be fine. Paying it for every single chunk isn't acceptable, particularly on real networks with latencies of perhaps 1,000 times higher.</p><p>The second point is something I've said before but will repeat: it's incredibly easy to experiment, measure, and improve a protocol over ØMQ. And when the cost of something comes way down, you can afford a lot more of it. Do learn to develop and prove your protocols in isolation: I've seen teams waste time trying to improve poorly designed protocols that are too deeply embedded in applications to be easily testable or fixable.</p><p>Our model two file transfer protocol isn't so bad, apart from performance:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>It completely eliminates any risk of memory exhaustion. To prove that, we set the high-water mark to 1 in both sender and receiver.</p></li><li class="listitem"><p>It lets the client choose the chunk size, which is useful because if there's any tuning of the chunk size to be done, for network conditions, for file types, or to reduce memory consumption further, it's the client that should be doing this.</p></li><li class="listitem"><p>It gives us fully restartable file transfers.</p></li><li class="listitem"><p>It allows the client to cancel the file transfer at any point in time.</p></li></ul></div><p>If we just didn't have to do a request for each chunk, it'd be a usable protocol. What we need is a way for the server to send multiple chunks without waiting for the client to request or acknowledge each one. What are our choices?</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The server could send 10 chunks at once, then wait for a single acknowledgment. That's exactly like multiplying the chunk size by 10, so it's pointless. And yes, it's just as pointless for all values of 10.</p></li><li class="listitem"><p>The server could send chunks without any chatter from the client but with a slight delay between each send, so that it would send chunks only as fast as the network could handle them. This would require the server to know what's happening at the network layer, which sounds like hard work. It also breaks layering horribly. And what happens if the network is really fast, but the client itself is slow? Where are chunks queued then?</p></li><li class="listitem"><p>The server could try to spy on the sending queue, i.e., see how full it is, and send only when the queue isn't full. Well, ØMQ doesn't allow that because it doesn't work, for the same reason as throttling doesn't work. The server and network may be more than fast enough, but the client may be a slow little device.</p></li><li class="listitem"><p>We could modify <code class="literal">libzmq</code> to take some other action on reaching HWM. Perhaps it could block? That would mean that a single slow client would block the whole server, so no thank you. Maybe it could return an error to the caller? Then the server could do something smart like... well, there isn't really anything it could do that's any better than dropping the message.</p></li></ul></div><p>Apart from being complex and variously unpleasant, none of these options would even work. What we need is a way for the client to tell the server, asynchronously and in the background, that it's ready for more. We need some kind of asynchronous flow control. If we do this right, data should flow without interruption from the server to the client, but only as long as the client is reading it. Let's review our three protocols. This was the first one:</p><pre class="screen">C: fetch
+S: chunk 1
+S: chunk 2
+S: chunk 3
+....
+</pre><p>And the second introduced a request for each chunk:</p><pre class="screen">C: fetch chunk 1
+S: send chunk 1
+C: fetch chunk 2
+S: send chunk 2
+C: fetch chunk 3
+S: send chunk 3
+C: fetch chunk 4
+....
+</pre><p>Now--waves hands mysteriously--here's a changed protocol that fixes the performance problem:</p><pre class="screen">C: fetch chunk 1
+C: fetch chunk 2
+C: fetch chunk 3
+S: send chunk 1
+C: fetch chunk 4
+S: send chunk 2
+S: send chunk 3
+....
+</pre><p>It looks suspiciously similar. In fact, it's identical except that we send multiple requests without waiting for a reply for each one. This is a technique called "pipelining" and it works because our DEALER and ROUTER sockets are fully asynchronous.</p><p>Here's the third model of our file transfer test-bench, with pipelining. The client sends a number of requests ahead (the "credit") and then each time it processes an incoming chunk, it sends one more credit. The server will never send more chunks than the client has asked for:</p><div class="example"><a id="fileio3-c"></a><p class="title"><strong>Example 7.6. File transfer test, model 3 (fileio3.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  File Transfer model #3
+//  
+//  In which the client requests each chunk individually, using
+//  command pipelining to give us a credit-based flow control.
+
+#include &lt;czmq.h&gt;
+#define CHUNK_SIZE  250000
+#define PIPELINE    10
+
+static void
+client_thread (void *args, zctx_t *ctx, void *pipe)
+{
+    void *dealer = zsocket_new (ctx, ZMQ_DEALER);
+    zsocket_connect (dealer, "tcp://127.0.0.1:6000");
+
+    //  Up to this many chunks in transit
+    size_t credit = PIPELINE;
+    
+    size_t total = 0;       //  Total bytes received
+    size_t chunks = 0;      //  Total chunks received
+    size_t offset = 0;      //  Offset of next chunk request
+    
+    while (true) {
+        while (credit) {
+            //  Ask for next chunk
+            zstr_sendm (dealer, "fetch");
+            zstr_sendm (dealer, "%ld", offset);
+            zstr_send  (dealer, "%ld", CHUNK_SIZE);
+            offset += CHUNK_SIZE;
+            credit--;
+        }
+        zframe_t *chunk = zframe_recv (dealer);
+        if (!chunk)
+            break;              //  Shutting down, quit
+        chunks++;
+        credit++;
+        size_t size = zframe_size (chunk);
+        zframe_destroy (&amp;chunk);
+        total += size;
+        if (size &lt; CHUNK_SIZE)
+            break;              //  Last chunk received; exit
+    }
+    printf ("%zd chunks received, %zd bytes\n", chunks, total);
+    zstr_send (pipe, "OK");
+}
+
+//  The rest of the code is exactly the same as in model 2, except
+//  that we set the HWM on the server's ROUTER socket to PIPELINE
+//  to act as a sanity check.
+...
+</pre></div></div><br class="example-break" /><p>That tweak gives us full control over the end-to-end pipeline including all network buffers and ØMQ queues at sender and receiver. We ensure the pipeline is always filled with data while never growing beyond a predefined limit. More than that, the client decides exactly when to send "credit" to the sender. It could be when it receives a chunk, or when it has fully processed a chunk. And this happens asynchronously, with no significant performance cost.</p><p>In the third model, I chose a pipeline size of 10 messages (each message is a chunk). This will cost a maximum of 2.5MB memory per client. So with 1GB of memory we can handle at least 400 clients. We can try to calculate the ideal pipeline size. It takes about 0.7 seconds to send the 1GB file, which is about 160 microseconds for a chunk. A round trip is 300 microseconds, so the pipeline needs to be at least 3-5 chunks to keep the server busy. In practice, I still got performance spikes with a pipeline of 5 chunks, probably because the credit messages sometimes get delayed by outgoing data. So at 10 chunks, it works consistently.</p><pre class="screen">$ time ./fileio3
+4291 chunks received, 1072741824 bytes
+
+real    0m0.777s
+user    0m0.096s
+sys     0m1.120s
+</pre><p>Do measure rigorously. Your calculations may be good, but the real world tends to have its own opinions.</p><p>What we've made is clearly not yet a real file transfer protocol, but it proves the pattern and I think it is the simplest plausible design. For a real working protocol, we might want to add some or all of:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Authentication and access controls, even without encryption: the point isn't to protect sensitive data, but to catch errors like sending test data to production servers.</p></li><li class="listitem"><p>A Cheap-style request including file path, optional compression, and other stuff we've learned is useful from HTTP (such as If-Modified-Since).</p></li><li class="listitem"><p>A Cheap-style response, at least for the first chunk, that provides meta data such as file size (so the client can pre-allocate, and avoid unpleasant disk-full situations).</p></li><li class="listitem"><p>The ability to fetch a set of files in one go, otherwise the protocol becomes inefficient for large sets of small files.</p></li><li class="listitem"><p>Confirmation from the client when it's fully received a file, to recover from chunks that might be lost of the client disconnects unexpectedly.</p></li></ul></div><p>So far, our semantic has been "fetch"; that is, the recipient knows (somehow) that they need a specific file, so they ask for it. The knowledge of which files exist and where they are is then passed out-of-band (e.g., in HTTP, by links in the HTML page).</p><p>How about a "push" semantic? There are two plausible use cases for this. First, if we adopt a centralized architecture with files on a main "server" (not something I'm advocating, but people do sometimes like this), then it's very useful to allow clients to upload files to the server. Second, it lets us do a kind of pub-sub for files, where the client asks for all new files of some type; as the server gets these, it forwards them to the client.</p><p>A fetch semantic is synchronous, while a push semantic is asynchronous. Asynchronous is less chatty, so faster. Also, you can do cute things like "subscribe to this path" thus creating a pub-sub file transfer architecture. That is so obviously awesome that I shouldn't need to explain what problem it solves.</p><p>Still, here is the problem with the fetch semantic: that out-of-band route to tell clients what files exist. No matter how you do this, it ends up being complex. Either clients have to poll, or you need a separate pub-sub channel to keep clients up-to-date, or you need user interaction.</p><p>Thinking this through a little more, though, we can see that fetch is just a special case of pub-sub. So we can get the best of both worlds. Here is the general design:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Fetch this path</p></li><li class="listitem"><p>Here is credit (repeat)</p></li></ul></div><p>To make this work (and we will, my dear readers), we need to be a little more explicit about how we send credit to the server. The cute trick of treating a pipelined "fetch chunk" request as credit won't fly because the client doesn't know any longer what files actually exist, how large they are, anything. If the client says, "I'm good for 250,000 bytes of data", this should work equally for 1 file of 250K bytes, or 100 files of 2,500 bytes.</p><p>And this gives us "credit-based flow control", which effectively removes the need for high-water marks, and any risk of memory overflow.</p></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch07s03.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch07.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch07s05.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Serializing Your Data </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> State Machines</td></tr></table></div></body></html>

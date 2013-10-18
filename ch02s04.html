@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Handling Interrupt Signals</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch02.html" title="Chapter 2. Sockets and Patterns" /><link rel="prev" href="ch02s03.html" title="Handling Errors and ETERM" /><link rel="next" href="ch02s05.html" title="Detecting Memory Leaks" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Handling Interrupt Signals</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch02s03.html">Prev</a> </td><th width="60%" align="center">Chapter 2. Sockets and Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch02s05.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Handling Interrupt Signals"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp19257816"></a>Handling Interrupt Signals</h2></div></div></div><p>Realistic applications need to shut down cleanly when interrupted with Ctrl-C or another signal such as <code class="literal">SIGTERM</code>. By default, these simply kill the process, meaning messages won't be flushed, files won't be closed cleanly, and so on.</p><p>Here is how we handle a signal in various languages:</p><div class="example"><a id="interrupt-c"></a><p class="title"><strong>Example 2.10. Handling Ctrl-C cleanly (interrupt.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Shows how to handle Ctrl-C
+
+#include &lt;zmq.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;signal.h&gt;
+
+//  Signal handling
+//
+//  Call s_catch_signals() in your application at startup, and then
+//  exit your main loop if s_interrupted is ever 1. Works especially
+//  well with zmq_poll.
+
+static int s_interrupted = 0;
+static void s_signal_handler (int signal_value)
+{
+    s_interrupted = 1;
+}
+
+static void s_catch_signals (void)
+{
+    struct sigaction action;
+    action.sa_handler = s_signal_handler;
+    action.sa_flags = 0;
+    sigemptyset (&amp;action.sa_mask);
+    sigaction (SIGINT, &amp;action, NULL);
+    sigaction (SIGTERM, &amp;action, NULL);
+}
+
+int main (void)
+{
+    void *context = zmq_ctx_new ();
+    void *socket = zmq_socket (context, ZMQ_REP);
+    zmq_bind (socket, "tcp://*:5555");
+
+    s_catch_signals ();
+    while (1) {
+        //  Blocking read will exit on a signal
+        char buffer [255];
+        zmq_recv (socket, buffer, 255, 0);
+        if (s_interrupted) {
+            printf ("W: interrupt received, killing server...\n");
+            break;
+        }
+    }
+    zmq_close (socket);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>The program provides <code class="literal">s_catch_signals()</code>, which traps Ctrl-C (<code class="literal">SIGINT</code>) and <code class="literal">SIGTERM</code>. When either of these signals arrive, the <code class="literal">s_catch_signals()</code> handler sets the global variable <code class="literal">s_interrupted</code>. Thanks to your signal handler, your application will not die automatically. Instead, you have a chance to clean up and exit gracefully. You have to now explicitly check for an interrupt and handle it properly. Do this by calling <code class="literal">s_catch_signals()</code> (copy this from <code class="literal">interrupt.c</code>) at the start of your main code. This sets up the signal handling. The interrupt will affect ØMQ calls as follows:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>If your code is blocking in a blocking call (sending a message, receiving a message, or polling), then when a signal arrives, the call will return with <code class="literal">EINTR</code>.</p></li><li class="listitem"><p>Wrappers like <code class="literal">s_recv()</code> return NULL if they are interrupted.</p></li></ul></div><p>So check for an <code class="literal">EINTR</code> return code, a NULL return, and/or <code class="literal">s_interrupted</code>.</p><p>Here is a typical code fragment:</p><pre class="screen">s_catch_signals ();
+client = zmq_socket (...);
+while (!s_interrupted) {
+    char *message = s_recv (client);
+    if (!message)
+        break;          //  Ctrl-C used
+}
+zmq_close (client);
+</pre><p>If you call <code class="literal">s_catch_signals()</code> and don't test for interrupts, then your application will become immune to Ctrl-C and <code class="literal">SIGTERM</code>, which may be useful, but is usually not.</p></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch02s03.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch02.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch02s05.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Handling Errors and ETERM </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Detecting Memory Leaks</td></tr></table></div></body></html>

@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>The Asynchronous Client/Server Pattern</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch03.html" title="Chapter 3. Advanced Request-Reply Patterns" /><link rel="prev" href="ch03s05.html" title="A High-Level API for ØMQ" /><link rel="next" href="ch03s07.html" title="Worked Example: Inter-Broker Routing" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">The Asynchronous Client/Server Pattern</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch03s05.html">Prev</a> </td><th width="60%" align="center">Chapter 3. Advanced Request-Reply Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch03s07.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="The Asynchronous Client/Server Pattern"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp19529000"></a>The Asynchronous Client/Server Pattern</h2></div></div></div><p>In the ROUTER to DEALER example, we saw a 1-to-N use case where one server talks asynchronously to multiple workers. We can turn this upside down to get a very useful N-to-1 architecture where various clients talk to a single server, and do this asynchronously<a class="xref" href="ch03s06.html#figure-37" title="Figure 3.12. Asynchronous Client/Server">Figure 3.12, “Asynchronous Client/Server”</a>.</p><div class="figure"><a id="figure-37"></a><p class="title"><strong>Figure 3.12. Asynchronous Client/Server</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig37.png" alt="Asynchronous Client/Server" /></div></div></div><br class="figure-break" /><p>Here's how it works:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Clients connect to the server and send requests.</p></li><li class="listitem"><p>For each request, the server sends 0 or more replies.</p></li><li class="listitem"><p>Clients can send multiple requests without waiting for a reply.</p></li><li class="listitem"><p>Servers can send multiple replies without waiting for new requests.</p></li></ul></div><p>Here's code that shows how this works:</p><div class="example"><a id="asyncsrv-c"></a><p class="title"><strong>Example 3.16. Asynchronous client/server (asyncsrv.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Asynchronous client-to-server (DEALER to ROUTER)
+//
+//  While this example runs in a single process, that is to make
+//  it easier to start and stop the example. Each task has its own
+//  context and conceptually acts as a separate process.
+
+#include "czmq.h"
+
+//  This is our client task
+//  It connects to the server, and then sends a request once per second
+//  It collects responses as they arrive, and it prints them out. We will
+//  run several client tasks in parallel, each with a different random ID.
+
+static void *
+client_task (void *args)
+{
+    zctx_t *ctx = zctx_new ();
+    void *client = zsocket_new (ctx, ZMQ_DEALER);
+
+    //  Set random identity to make tracing easier
+    char identity [10];
+    sprintf (identity, "%04X-%04X", randof (0x10000), randof (0x10000));
+    zsocket_set_identity (client, identity);
+    zsocket_connect (client, "tcp://localhost:5570");
+
+    zmq_pollitem_t items [] = { { client, 0, ZMQ_POLLIN, 0 } };
+    int request_nbr = 0;
+    while (true) {
+        //  Tick once per second, pulling in arriving messages
+        int centitick;
+        for (centitick = 0; centitick &lt; 100; centitick++) {
+            zmq_poll (items, 1, 10 * ZMQ_POLL_MSEC);
+            if (items [0].revents &amp; ZMQ_POLLIN) {
+                zmsg_t *msg = zmsg_recv (client);
+                zframe_print (zmsg_last (msg), identity);
+                zmsg_destroy (&amp;msg);
+            }
+        }
+        zstr_send (client, "request #%d", ++request_nbr);
+    }
+    zctx_destroy (&amp;ctx);
+    return NULL;
+}
+</pre></div></div><br class="example-break" /><p>This is our server task. It uses the multithreaded server model to deal requests out to a pool of workers and route replies back to clients. One worker can handle one request at a time but one client can talk to multiple workers at once. 
+</p><div class="example"><a id="asyncsrv-c-1"></a><p class="title"><strong>Example 3.17. Asynchronous client/server (asyncsrv.c) - server task</strong></p><div class="example-contents"><pre class="programlisting">
+
+static void server_worker (void *args, zctx_t *ctx, void *pipe);
+
+void *server_task (void *args)
+{
+    //  Frontend socket talks to clients over TCP
+    zctx_t *ctx = zctx_new ();
+    void *frontend = zsocket_new (ctx, ZMQ_ROUTER);
+    zsocket_bind (frontend, "tcp://*:5570");
+
+    //  Backend socket talks to workers over inproc
+    void *backend = zsocket_new (ctx, ZMQ_DEALER);
+    zsocket_bind (backend, "inproc://backend");
+
+    //  Launch pool of worker threads, precise number is not critical
+    int thread_nbr;
+    for (thread_nbr = 0; thread_nbr &lt; 5; thread_nbr++)
+        zthread_fork (ctx, server_worker, NULL);
+
+    //  Connect backend to frontend via a proxy
+    zmq_proxy (frontend, backend, NULL);
+
+    zctx_destroy (&amp;ctx);
+    return NULL;
+}
+</pre></div></div><br class="example-break" /><p>Each worker task works on one request at a time and sends a random number of replies back, with random delays between replies: 
+</p><div class="example"><a id="asyncsrv-c-2"></a><p class="title"><strong>Example 3.18. Asynchronous client/server (asyncsrv.c) - worker task</strong></p><div class="example-contents"><pre class="programlisting">
+
+static void
+server_worker (void *args, zctx_t *ctx, void *pipe)
+{
+    void *worker = zsocket_new (ctx, ZMQ_DEALER);
+    zsocket_connect (worker, "inproc://backend");
+
+    while (true) {
+        //  The DEALER socket gives us the reply envelope and message
+        zmsg_t *msg = zmsg_recv (worker);
+        zframe_t *identity = zmsg_pop (msg);
+        zframe_t *content = zmsg_pop (msg);
+        assert (content);
+        zmsg_destroy (&amp;msg);
+
+        //  Send 0..4 replies back
+        int reply, replies = randof (5);
+        for (reply = 0; reply &lt; replies; reply++) {
+            //  Sleep for some fraction of a second
+            zclock_sleep (randof (1000) + 1);
+            zframe_send (&amp;identity, worker, ZFRAME_REUSE + ZFRAME_MORE);
+            zframe_send (&amp;content, worker, ZFRAME_REUSE);
+        }
+        zframe_destroy (&amp;identity);
+        zframe_destroy (&amp;content);
+    }
+}
+
+//  The main thread simply starts several clients and a server, and then
+//  waits for the server to finish.
+
+int main (void)
+{
+    zthread_new (client_task, NULL);
+    zthread_new (client_task, NULL);
+    zthread_new (client_task, NULL);
+    zthread_new (server_task, NULL);
+    zclock_sleep (5 * 1000);    //  Run for 5 seconds then quit
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>The example runs in one process, with multiple threads simulating a real multiprocess architecture. When you run the example, you'll see three clients (each with a random ID), printing out the replies they get from the server. Look carefully and you'll see each client task gets 0 or more replies per request.</p><p>Some comments on this code:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The clients send a request once per second, and get zero or more replies back. To make this work using <code class="literal">zmq_poll()</code>, we can't simply poll with a 1-second timeout, or we'd end up sending a new request only one second <span class="emphasis"><em>after we received the last reply</em></span>. So we poll at a high frequency (100 times at 1/100th of a second per poll), which is approximately accurate.</p></li><li class="listitem"><p>The server uses a pool of worker threads, each processing one request synchronously. It connects these to its frontend socket using an internal queue<a class="xref" href="ch03s06.html#figure-38" title="Figure 3.13. Detail of Asynchronous Server">Figure 3.13, “Detail of Asynchronous Server”</a>. It connects the frontend and backend sockets using a <code class="literal">zmq_proxy()</code> call.</p></li></ul></div><div class="figure"><a id="figure-38"></a><p class="title"><strong>Figure 3.13. Detail of Asynchronous Server</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig38.png" alt="Detail of Asynchronous Server" /></div></div></div><br class="figure-break" /><p>Note that we're doing DEALER to ROUTER dialog between client and server, but internally between the server main thread and workers, we're doing DEALER to DEALER. If the workers were strictly synchronous, we'd use REP. However, because we want to send multiple replies, we need an async socket. We do <span class="emphasis"><em>not</em></span> want to route replies, they always go to the single server thread that sent us the request.</p><p>Let's think about the routing envelope. The client sends a message consisting of a single frame. The server thread receives a two-frame message (original message prefixed by client identity). We send these two frames on to the worker, which treats it as a normal reply envelope, returns that to us as a two frame message. We then use the first frame as an identity to route the second frame back to the client as a reply.</p><p>It looks something like this:</p><pre class="screen">     client          server       frontend       worker
+   [ DEALER ]&lt;----&gt;[ ROUTER &lt;----&gt; DEALER &lt;----&gt; DEALER ]
+             1 part         2 parts       2 parts
+</pre><p>Now for the sockets: we could use the load balancing ROUTER to DEALER pattern to talk to workers, but it's extra work. In this case, a DEALER to DEALER pattern is probably fine: the trade-off is lower latency for each request, but higher risk of unbalanced work distribution. Simplicity wins in this case.</p><p>When you build servers that maintain stateful conversations with clients, you will run into a classic problem. If the server keeps some state per client, and clients keep coming and going, eventually it will run out of resources. Even if the same clients keep connecting, if you're using default identities, each connection will look like a new one.</p><p>We cheat in the above example by keeping state only for a very short time (the time it takes a worker to process a request) and then throwing away the state. But that's not practical for many cases. To properly manage client state in a stateful asynchronous server, you have to:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Do heartbeating from client to server. In our example, we send a request once per second, which can reliably be used as a heartbeat.</p></li><li class="listitem"><p>Store state using the client identity (whether generated or explicit) as key.</p></li><li class="listitem"><p>Detect a stopped heartbeat. If there's no request from a client within, say, two seconds, the server can detect this and destroy any state it's holding for that client.</p></li></ul></div></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch03s05.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch03.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch03s07.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">A High-Level API for ØMQ </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Worked Example: Inter-Broker Routing</td></tr></table></div></body></html>

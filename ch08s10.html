@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Writing the Unprotocol</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch08.html" title="Chapter 8. A Framework for Distributed Computing" /><link rel="prev" href="ch08s09.html" title="Content Distribution" /><link rel="next" href="ch08s11.html" title="Example Zyre Application" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Writing the Unprotocol</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch08s09.html">Prev</a> </td><th width="60%" align="center">Chapter 8. A Framework for Distributed Computing</th><td width="20%" align="right"> <a accesskey="n" href="ch08s11.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Writing the Unprotocol"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp21488336"></a>Writing the Unprotocol</h2></div></div></div><p>We have all the pieces for a formal protocol specification and it's time to put the protocol on paper. There are two reasons for this. First, to make sure that any other implementations talk to each other properly. Second, because I want to get an official port for the UDP discovery protocol and that means doing the paperwork.</p><p>Like all the other unprotocols we developed in this book, the protocol lives on <a class="ulink" href="http://rfc.zeromq.org/spec:20" target="_top">the ØMQ RFC site</a>. The core of the protocol specification is the ABNF grammar for the commands and fields:</p><pre class="screen">zre-protocol    = greeting *traffic
+
+greeting        = S:HELLO
+traffic         = S:WHISPER
+                / S:SHOUT
+                / S:JOIN
+                / S:LEAVE
+                / S:PING R:PING-OK
+
+;   Greet a peer so it can connect back to us
+S:HELLO         = header %x01 ipaddress mailbox groups status headers
+header          = signature sequence
+signature       = %xAA %xA1
+sequence        = 2OCTET        ; Incremental sequence number
+ipaddress       = string        ; Sender IP address
+string          = size *VCHAR
+size            = OCTET
+mailbox         = 2OCTET        ; Sender mailbox port number
+groups          = strings       ; List of groups sender is in
+strings         = size *string
+status          = OCTET         ; Sender group status sequence
+headers         = dictionary    ; Sender header properties
+dictionary      = size *key-value
+key-value       = string        ; Formatted as name=value
+
+; Send a message to a peer
+S:WHISPER       = header %x02 content
+content         = FRAME         ; Message content as 0MQ frame
+
+; Send a message to a group
+S:SHOUT         = header %x03 group content
+group           = string        ; Name of group
+content         = FRAME         ; Message content as 0MQ frame
+
+; Join a group
+S:JOIN          = header %x04 group status
+status          = OCTET         ; Sender group status sequence
+
+; Leave a group
+S:LEAVE         = header %x05 group status
+
+; Ping a peer that has gone silent
+S:PING          = header %06
+
+; Reply to a peer's ping
+R:PING-OK       = header %07
+</pre></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch08s09.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch08.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch08s11.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Content Distribution </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Example Zyre Application</td></tr></table></div></body></html>

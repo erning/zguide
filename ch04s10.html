@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Service Discovery</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch04.html" title="Chapter 4. Reliable Request-Reply Patterns" /><link rel="prev" href="ch04s09.html" title="Asynchronous Majordomo Pattern" /><link rel="next" href="ch04s11.html" title="Idempotent Services" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Service Discovery</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch04s09.html">Prev</a> </td><th width="60%" align="center">Chapter 4. Reliable Request-Reply Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch04s11.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Service Discovery"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp19911344"></a>Service Discovery</h2></div></div></div><p>So, we have a nice service-oriented broker, but we have no way of knowing whether a particular service is available or not. We know whether a request failed, but we don't know why. It is useful to be able to ask the broker, "is the echo service running?" The most obvious way would be to modify our MDP/Client protocol to add commands to ask this. But MDP/Client has the great charm of being simple. Adding service discovery to it would make it as complex as the MDP/Worker protocol.</p><p>Another option is to do what email does, and ask that undeliverable requests be returned. This can work well in an asynchronous world, but it also adds complexity. We need ways to distinguish returned requests from replies and to handle these properly.</p><p>Let's try to use what we've already built, building on top of MDP instead of modifying it. Service discovery is, itself, a service. It might indeed be one of several management services, such as "disable service X", "provide statistics", and so on. What we want is a general, extensible solution that doesn't affect the protocol or existing applications.</p><p>So here's a small RFC that layers this on top of MDP: <a class="ulink" href="http://rfc.zeromq.org/spec:8" target="_top">the Majordomo Management Interface (MMI)</a>. We already implemented it in the broker, though unless you read the whole thing you probably missed that. I'll explain how it works in the broker:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>When a client requests a service that starts with <code class="literal">mmi.</code>, instead of routing this to a worker, we handle it internally.</p></li><li class="listitem"><p>We handle just one service in this broker, which is <code class="literal">mmi.service</code>, the service discovery service.</p></li><li class="listitem"><p>The payload for the request is the name of an external service (a real one, provided by a worker).</p></li><li class="listitem"><p>The broker returns "200" (OK) or "404" (Not found), depending on whether there are workers registered for that service or not.</p></li></ul></div><p>Here's how we use the service discovery in an application:</p><div class="example"><a id="mmiecho-c"></a><p class="title"><strong>Example 4.52. Service discovery over Majordomo (mmiecho.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  MMI echo query example
+
+//  Lets us build this source without creating a library
+#include "mdcliapi.c"
+
+int main (int argc, char *argv [])
+{
+    int verbose = (argc &gt; 1 &amp;&amp; streq (argv [1], "-v"));
+    mdcli_t *session = mdcli_new ("tcp://localhost:5555", verbose);
+
+    //  This is the service we want to look up
+    zmsg_t *request = zmsg_new ();
+    zmsg_addstr (request, "echo");
+
+    //  This is the service we send our request to
+    zmsg_t *reply = mdcli_send (session, "mmi.service", &amp;request);
+
+    if (reply) {
+        char *reply_code = zframe_strdup (zmsg_first (reply));
+        printf ("Lookup echo service: %s\n", reply_code);
+        free (reply_code);
+        zmsg_destroy (&amp;reply);
+    }
+    else
+        printf ("E: no response from broker, make sure it's running\n");
+
+    mdcli_destroy (&amp;session);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>Try this with and without a worker running, and you should see the little program report "200" or "404" accordingly. The implementation of MMI in our example broker is flimsy. For example, if a worker disappears, services remain "present". In practice, a broker should remove services that have no workers after some configurable timeout.</p></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch04s09.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch04.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch04s11.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Asynchronous Majordomo Pattern </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Idempotent Services</td></tr></table></div></body></html>

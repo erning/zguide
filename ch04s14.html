@@ -1,0 +1,709 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Brokerless Reliability (Freelance Pattern)</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch04.html" title="Chapter 4. Reliable Request-Reply Patterns" /><link rel="prev" href="ch04s13.html" title="High-Availability Pair (Binary Star Pattern)" /><link rel="next" href="ch04s15.html" title="Conclusion" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Brokerless Reliability (Freelance Pattern)</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch04s13.html">Prev</a> </td><th width="60%" align="center">Chapter 4. Reliable Request-Reply Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch04s15.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Brokerless Reliability (Freelance Pattern)"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp20070816"></a>Brokerless Reliability (Freelance Pattern)</h2></div></div></div><p>It might seem ironic to focus so much on broker-based reliability, when we often explain ØMQ as "brokerless messaging". However, in messaging, as in real life, the middleman is both a burden and a benefit. In practice, most messaging architectures benefit from a mix of distributed and brokered messaging. You get the best results when you can decide freely what trade-offs you want to make. This is why I can drive twenty minutes to a wholesaler to buy five cases of wine for a party, but I can also walk ten minutes to a corner store to buy one bottle for a dinner. Our highly context-sensitive relative valuations of time, energy, and cost are essential to the real world economy. And they are essential to an optimal message-based architecture.</p><p>This is why ØMQ does not <span class="emphasis"><em>impose</em></span> a broker-centric architecture, though it does give you the tools to build brokers, aka <span class="emphasis"><em>proxies</em></span>, and we've built a dozen or so different ones so far, just for practice.</p><p>So we'll end this chapter by deconstructing the broker-based reliability we've built so far, and turning it back into a distributed peer-to-peer architecture I call the Freelance pattern. Our use case will be a name resolution service. This is a common problem with ØMQ architectures: how do we know the endpoint to connect to? Hard-coding TCP/IP addresses in code is insanely fragile. Using configuration files creates an administration nightmare. Imagine if you had to hand-configure your web browser, on every PC or mobile phone you used, to realize that "google.com" was "74.125.230.82".</p><p>A ØMQ name service (and we'll make a simple implementation) must do the following:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Resolve a logical name into at least a bind endpoint, and a connect endpoint. A realistic name service would provide multiple bind endpoints, and possibly multiple connect endpoints as well.</p></li><li class="listitem"><p>Allow us to manage multiple parallel environments, e.g., "test" versus "production", without modifying code.</p></li><li class="listitem"><p>Be reliable, because if it is unavailable, applications won't be able to connect to the network.</p></li></ul></div><p>Putting a name service behind a service-oriented Majordomo broker is clever from some points of view. However, it's simpler and much less surprising to just expose the name service as a server to which clients can connect directly. If we do this right, the name service becomes the <span class="emphasis"><em>only</em></span> global network endpoint we need to hard-code in our code or configuration files.</p><div class="figure"><a id="figure-55"></a><p class="title"><strong>Figure 4.9. The Freelance Pattern</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig55.png" alt="The Freelance Pattern" /></div></div></div><br class="figure-break" /><p>The types of failure we aim to handle are server crashes and restarts, server busy looping, server overload, and network issues. To get reliability, we'll create a pool of name servers so if one crashes or goes away, clients can connect to another, and so on. In practice, two would be enough. But for the example, we'll assume the pool can be any size<a class="xref" href="ch05s05.html#figure-56" title="Figure 5.1. The Simple Black Box Pattern">Figure 5.1, “The Simple Black Box Pattern”</a>.</p><p>In this architecture, a large set of clients connect to a small set of servers directly. The servers bind to their respective addresses. It's fundamentally different from a broker-based approach like Majordomo, where workers connect to the broker. Clients have a couple of options:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Use REQ sockets and the Lazy Pirate pattern. Easy, but would need some additional intelligence so clients don't stupidly try to reconnect to dead servers over and over.</p></li><li class="listitem"><p>Use DEALER sockets and blast out requests (which will be load balanced to all connected servers) until they get a reply. Effective, but not elegant.</p></li><li class="listitem"><p>Use ROUTER sockets so clients can address specific servers. But how does the client know the identity of the server sockets? Either the server has to ping the client first (complex), or the server has to use a hard-coded, fixed identity known to the client (nasty).</p></li></ul></div><p>We'll develop each of these in the following subsections.</p><div class="sect2" title="Model One: Simple Retry and Failover"><div class="titlepage"><div><div><h3 class="title"><a id="idp20080512"></a>Model One: Simple Retry and Failover</h3></div></div></div><p>So our menu appears to offer: simple, brutal, complex, or nasty. Let's start with simple and then work out the kinks. We take Lazy Pirate and rewrite it to work with multiple server endpoints.</p><p>Start one or several servers first, specifying a bind endpoint as the argument:</p><div class="example"><a id="flserver1-c"></a><p class="title"><strong>Example 4.77. Freelance server, Model One (flserver1.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Freelance server - Model 1
+//  Trivial echo service
+
+#include "czmq.h"
+
+int main (int argc, char *argv [])
+{
+    if (argc &lt; 2) {
+        printf ("I: syntax: %s &lt;endpoint&gt;\n", argv [0]);
+        return 0;
+    }
+    zctx_t *ctx = zctx_new ();
+    void *server = zsocket_new (ctx, ZMQ_REP);
+    zsocket_bind (server, argv [1]);
+
+    printf ("I: echo service is ready at %s\n", argv [1]);
+    while (true) {
+        zmsg_t *msg = zmsg_recv (server);
+        if (!msg)
+            break;          //  Interrupted
+        zmsg_send (&amp;msg, server);
+    }
+    if (zctx_interrupted)
+        printf ("W: interrupted\n");
+
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>Then start the client, specifying one or more connect endpoints as arguments:</p><div class="example"><a id="flclient1-c"></a><p class="title"><strong>Example 4.78. Freelance client, Model One (flclient1.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Freelance client - Model 1
+//  Uses REQ socket to query one or more services
+
+#include "czmq.h"
+#define REQUEST_TIMEOUT     1000
+#define MAX_RETRIES         3       //  Before we abandon
+
+static zmsg_t *
+s_try_request (zctx_t *ctx, char *endpoint, zmsg_t *request)
+{
+    printf ("I: trying echo service at %s...\n", endpoint);
+    void *client = zsocket_new (ctx, ZMQ_REQ);
+    zsocket_connect (client, endpoint);
+
+    //  Send request, wait safely for reply
+    zmsg_t *msg = zmsg_dup (request);
+    zmsg_send (&amp;msg, client);
+    zmq_pollitem_t items [] = { { client, 0, ZMQ_POLLIN, 0 } };
+    zmq_poll (items, 1, REQUEST_TIMEOUT * ZMQ_POLL_MSEC);
+    zmsg_t *reply = NULL;
+    if (items [0].revents &amp; ZMQ_POLLIN)
+        reply = zmsg_recv (client);
+
+    //  Close socket in any case, we're done with it now
+    zsocket_destroy (ctx, client);
+    return reply;
+}
+</pre></div></div><br class="example-break" /><p>The client uses a Lazy Pirate strategy if it only has one server to talk to. If it has two or more servers to talk to, it will try each server just once: 
+</p><div class="example"><a id="flclient1-c-1"></a><p class="title"><strong>Example 4.79. Freelance client, Model One (flclient1.c) - client task</strong></p><div class="example-contents"><pre class="programlisting">
+
+int main (int argc, char *argv [])
+{
+    zctx_t *ctx = zctx_new ();
+    zmsg_t *request = zmsg_new ();
+    zmsg_addstr (request, "Hello world");
+    zmsg_t *reply = NULL;
+
+    int endpoints = argc - 1;
+    if (endpoints == 0)
+        printf ("I: syntax: %s &lt;endpoint&gt; ...\n", argv [0]);
+    else
+    if (endpoints == 1) {
+        //  For one endpoint, we retry N times
+        int retries;
+        for (retries = 0; retries &lt; MAX_RETRIES; retries++) {
+            char *endpoint = argv [1];
+            reply = s_try_request (ctx, endpoint, request);
+            if (reply)
+                break;          //  Successful
+            printf ("W: no response from %s, retrying...\n", endpoint);
+        }
+    }
+    else {
+        //  For multiple endpoints, try each at most once
+        int endpoint_nbr;
+        for (endpoint_nbr = 0; endpoint_nbr &lt; endpoints; endpoint_nbr++) {
+            char *endpoint = argv [endpoint_nbr + 1];
+            reply = s_try_request (ctx, endpoint, request);
+            if (reply)
+                break;          //  Successful
+            printf ("W: no response from %s\n", endpoint);
+        }
+    }
+    if (reply)
+        printf ("Service is running OK\n");
+
+    zmsg_destroy (&amp;request);
+    zmsg_destroy (&amp;reply);
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>A sample run is:</p><pre class="screen">flserver1 tcp://*:5555 &amp;
+flserver1 tcp://*:5556 &amp;
+flclient1 tcp://localhost:5555 tcp://localhost:5556
+</pre><p>Although the basic approach is Lazy Pirate, the client aims to just get one successful reply. It has two techniques, depending on whether you are running a single server or multiple servers:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>With a single server, the client will retry several times, exactly as for Lazy Pirate.</p></li><li class="listitem"><p>With multiple servers, the client will try each server at most once until it's received a reply or has tried all servers.</p></li></ul></div><p>This solves the main weakness of Lazy Pirate, namely that it could not fail over to backup or alternate servers.</p><p>However, this design won't work well in a real application. If we're connecting many sockets and our primary name server is down, we're going to experience this painful timeout each time.</p></div><div class="sect2" title="Model Two: Brutal Shotgun Massacre"><div class="titlepage"><div><div><h3 class="title"><a id="idp20092136"></a>Model Two: Brutal Shotgun Massacre</h3></div></div></div><p>Let's switch our client to using a DEALER socket. Our goal here is to make sure we get a reply back within the shortest possible time, no matter whether a particular server is up or down. Our client takes this approach:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>We set things up, connecting to all servers.</p></li><li class="listitem"><p>When we have a request, we blast it out as many times as we have servers.</p></li><li class="listitem"><p>We wait for the first reply, and take that.</p></li><li class="listitem"><p>We ignore any other replies.</p></li></ul></div><p>What will happen in practice is that when all servers are running, ØMQ will distribute the requests so that each server gets one request and sends one reply. When any server is offline and disconnected, ØMQ will distribute the requests to the remaining servers. So a server may in some cases get the same request more than once.</p><p>What's more annoying for the client is that we'll get multiple replies back, but there's no guarantee we'll get a precise number of replies. Requests and replies can get lost (e.g., if the server crashes while processing a request).</p><p>So we have to number requests and ignore any replies that don't match the request number. Our Model One server will work because it's an echo server, but coincidence is not a great basis for understanding. So we'll make a Model Two server that chews up the message and returns a correctly numbered reply with the content "OK". We'll use messages consisting of two parts: a sequence number and a body.</p><p>Start one or more servers, specifying a bind endpoint each time:</p><div class="example"><a id="flserver2-c"></a><p class="title"><strong>Example 4.80. Freelance server, Model Two (flserver2.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Freelance server - Model 2
+//  Does some work, replies OK, with message sequencing
+
+#include "czmq.h"
+
+int main (int argc, char *argv [])
+{
+    if (argc &lt; 2) {
+        printf ("I: syntax: %s &lt;endpoint&gt;\n", argv [0]);
+        return 0;
+    }
+    zctx_t *ctx = zctx_new ();
+    void *server = zsocket_new (ctx, ZMQ_REP);
+    zsocket_bind (server, argv [1]);
+
+    printf ("I: service is ready at %s\n", argv [1]);
+    while (true) {
+        zmsg_t *request = zmsg_recv (server);
+        if (!request)
+            break;          //  Interrupted
+        //  Fail nastily if run against wrong client
+        assert (zmsg_size (request) == 2);
+
+        zframe_t *identity = zmsg_pop (request);
+        zmsg_destroy (&amp;request);
+
+        zmsg_t *reply = zmsg_new ();
+        zmsg_add (reply, identity);
+        zmsg_addstr (reply, "OK");
+        zmsg_send (&amp;reply, server);
+    }
+    if (zctx_interrupted)
+        printf ("W: interrupted\n");
+
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>Then start the client, specifying the connect endpoints as arguments:</p><div class="example"><a id="flclient2-c"></a><p class="title"><strong>Example 4.81. Freelance client, Model Two (flclient2.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Freelance client - Model 2
+//  Uses DEALER socket to blast one or more services
+
+#include "czmq.h"
+
+//  We design our client API as a class, using the CZMQ style
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct _flclient_t flclient_t;
+flclient_t *flclient_new (void);
+void        flclient_destroy (flclient_t **self_p);
+void        flclient_connect (flclient_t *self, char *endpoint);
+zmsg_t     *flclient_request (flclient_t *self, zmsg_t **request_p);
+
+#ifdef __cplusplus
+}
+#endif
+
+//  If not a single service replies within this time, give up
+#define GLOBAL_TIMEOUT 2500
+
+int main (int argc, char *argv [])
+{
+    if (argc == 1) {
+        printf ("I: syntax: %s &lt;endpoint&gt; ...\n", argv [0]);
+        return 0;
+    }
+    //  Create new freelance client object
+    flclient_t *client = flclient_new ();
+
+    //  Connect to each endpoint
+    int argn;
+    for (argn = 1; argn &lt; argc; argn++)
+        flclient_connect (client, argv [argn]);
+
+    //  Send a bunch of name resolution 'requests', measure time
+    int requests = 10000;
+    uint64_t start = zclock_time ();
+    while (requests--) {
+        zmsg_t *request = zmsg_new ();
+        zmsg_addstr (request, "random name");
+        zmsg_t *reply = flclient_request (client, &amp;request);
+        if (!reply) {
+            printf ("E: name service not available, aborting\n");
+            break;
+        }
+        zmsg_destroy (&amp;reply);
+    }
+    printf ("Average round trip cost: %d usec\n",
+        (int) (zclock_time () - start) / 10);
+
+    flclient_destroy (&amp;client);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>Here is the <code class="literal">flclient</code> class implementation. Each instance has a context, a DEALER socket it uses to talk to the servers, a counter of how many servers it's connected to, and a request sequence number: 
+</p><div class="example"><a id="flclient2-c-1"></a><p class="title"><strong>Example 4.82. Freelance client, Model Two (flclient2.c) - class implementation</strong></p><div class="example-contents"><pre class="programlisting">
+
+struct _flclient_t {
+    zctx_t *ctx;        //  Our context wrapper
+    void *socket;       //  DEALER socket talking to servers
+    size_t servers;     //  How many servers we have connected to
+    uint sequence;      //  Number of requests ever sent
+};
+
+//  Constructor
+
+flclient_t *
+flclient_new (void)
+{
+    flclient_t
+        *self;
+
+    self = (flclient_t *) zmalloc (sizeof (flclient_t));
+    self-&gt;ctx = zctx_new ();
+    self-&gt;socket = zsocket_new (self-&gt;ctx, ZMQ_DEALER);
+    return self;
+}
+
+//  Destructor
+
+void
+flclient_destroy (flclient_t **self_p)
+{
+    assert (self_p);
+    if (*self_p) {
+        flclient_t *self = *self_p;
+        zctx_destroy (&amp;self-&gt;ctx);
+        free (self);
+        *self_p = NULL;
+    }
+}
+
+//  Connect to new server endpoint
+
+void
+flclient_connect (flclient_t *self, char *endpoint)
+{
+    assert (self);
+    zsocket_connect (self-&gt;socket, endpoint);
+    self-&gt;servers++;
+}
+</pre></div></div><br class="example-break" /><p>This method does the hard work. It sends a request to all connected servers in parallel (for this to work, all connections must be successful and completed by this time). It then waits for a single successful reply, and returns that to the caller. Any other replies are just dropped: 
+</p><div class="example"><a id="flclient2-c-2"></a><p class="title"><strong>Example 4.83. Freelance client, Model Two (flclient2.c) - request method</strong></p><div class="example-contents"><pre class="programlisting">
+
+zmsg_t *
+flclient_request (flclient_t *self, zmsg_t **request_p)
+{
+    assert (self);
+    assert (*request_p);
+    zmsg_t *request = *request_p;
+
+    //  Prefix request with sequence number and empty envelope
+    char sequence_text [10];
+    sprintf (sequence_text, "%u", ++self-&gt;sequence);
+    zmsg_pushstr (request, sequence_text);
+    zmsg_pushstr (request, "");
+
+    //  Blast the request to all connected servers
+    int server;
+    for (server = 0; server &lt; self-&gt;servers; server++) {
+        zmsg_t *msg = zmsg_dup (request);
+        zmsg_send (&amp;msg, self-&gt;socket);
+    }
+    //  Wait for a matching reply to arrive from anywhere
+    //  Since we can poll several times, calculate each one
+    zmsg_t *reply = NULL;
+    uint64_t endtime = zclock_time () + GLOBAL_TIMEOUT;
+    while (zclock_time () &lt; endtime) {
+        zmq_pollitem_t items [] = { { self-&gt;socket, 0, ZMQ_POLLIN, 0 } };
+        zmq_poll (items, 1, (endtime - zclock_time ()) * ZMQ_POLL_MSEC);
+        if (items [0].revents &amp; ZMQ_POLLIN) {
+            //  Reply is [empty][sequence][OK]
+            reply = zmsg_recv (self-&gt;socket);
+            assert (zmsg_size (reply) == 3);
+            free (zmsg_popstr (reply));
+            char *sequence = zmsg_popstr (reply);
+            int sequence_nbr = atoi (sequence);
+            free (sequence);
+            if (sequence_nbr == self-&gt;sequence)
+                break;
+            zmsg_destroy (&amp;reply);
+        }
+    }
+    zmsg_destroy (request_p);
+    return reply;
+}
+</pre></div></div><br class="example-break" /><p>Here are some things to note about the client implementation:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The client is structured as a nice little class-based API that hides the dirty work of creating ØMQ contexts and sockets and talking to the server. That is, if a shotgun blast to the midriff can be called "talking".</p></li><li class="listitem"><p>The client will abandon the chase if it can't find <span class="emphasis"><em>any</em></span> responsive server within a few seconds.</p></li><li class="listitem"><p>The client has to create a valid REP envelope, i.e., add an empty message frame to the front of the message.</p></li></ul></div><p>The client performs 10,000 name resolution requests (fake ones, as our server does essentially nothing) and measures the average cost. On my test box, talking to one server, this requires about 60 microseconds. Talking to three servers, it takes about 80 microseconds.</p><p>The pros and cons of our shotgun approach are:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Pro: it is simple, easy to make and easy to understand.</p></li><li class="listitem"><p>Pro: it does the job of failover, and works rapidly, so long as there is at least one server running.</p></li><li class="listitem"><p>Con: it creates redundant network traffic.</p></li><li class="listitem"><p>Con: we can't prioritize our servers, i.e., Primary, then Secondary.</p></li><li class="listitem"><p>Con: the server can do at most one request at a time, period.</p></li></ul></div></div><div class="sect2" title="Model Three: Complex and Nasty"><div class="titlepage"><div><div><h3 class="title"><a id="idp20115664"></a>Model Three: Complex and Nasty</h3></div></div></div><p>The shotgun approach seems too good to be true. Let's be scientific and work through all the alternatives. We're going to explore the complex/nasty option, even if it's only to finally realize that we preferred brutal. Ah, the story of my life.</p><p>We can solve the main problems of the client by switching to a ROUTER socket. That lets us send requests to specific servers, avoid servers we know are dead, and in general be as smart as we want to be. We can also solve the main problem of the server (single-threadedness) by switching to a ROUTER socket.</p><p>But doing ROUTER to ROUTER between two anonymous sockets (which haven't set an identity) is not possible. Both sides generate an identity (for the other peer) only when they receive a first message, and thus neither can talk to the other until it has first received a message. The only way out of this conundrum is to cheat, and use hard-coded identities in one direction. The proper way to cheat, in a client/server case, is to let the client "know" the identity of the server. Doing it the other way around would be insane, on top of complex and nasty, because any number of clients should be able to arise independently. Insane, complex, and nasty are great attributes for a genocidal dictator, but terrible ones for software.</p><p>Rather than invent yet another concept to manage, we'll use the connection endpoint as identity. This is a unique string on which both sides can agree without more prior knowledge than they already have for the shotgun model. It's a sneaky and effective way to connect two ROUTER sockets.</p><p>Remember how ØMQ identities work. The server ROUTER socket sets an identity before it binds its socket. When a client connects, they do a little handshake to exchange identities, before either side sends a real message. The client ROUTER socket, having not set an identity, sends a null identity to the server. The server generates a random UUID to designate the client for its own use. The server sends its identity (which we've agreed is going to be an endpoint string) to the client.</p><p>This means that our client can route a message to the server (i.e., send on its ROUTER socket, specifying the server endpoint as identity) as soon as the connection is established. That's not <span class="emphasis"><em>immediately</em></span> after doing a <code class="literal">zmq_connect()</code>, but some random time thereafter. Herein lies one problem: we don't know when the server will actually be available and complete its connection handshake. If the server is online, it could be after a few milliseconds. If the server is down and the sysadmin is out to lunch, it could be an hour from now.</p><p>There's a small paradox here. We need to know when servers become connected and available for work. In the Freelance pattern, unlike the broker-based patterns we saw earlier in this chapter, servers are silent until spoken to. Thus we can't talk to a server until it's told us it's online, which it can't do until we've asked it.</p><p>My solution is to mix in a little of the shotgun approach from model 2, meaning we'll fire (harmless) shots at anything we can, and if anything moves, we know it's alive. We're not going to fire real requests, but rather a kind of ping-pong heartbeat.</p><p>This brings us to the realm of protocols again, so here's a <a class="ulink" href="http://rfc.zeromq.org/spec:10" target="_top">short spec that defines how a Freelance client and server exchange ping-pong commands and request-reply commands</a>.</p><p>It is short and sweet to implement as a server. Here's our echo server, Model Three, now speaking FLP:</p><div class="example"><a id="flserver3-c"></a><p class="title"><strong>Example 4.84. Freelance server, Model Three (flserver3.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Freelance server - Model 3
+//  Uses an ROUTER/ROUTER socket but just one thread
+
+#include "czmq.h"
+
+int main (int argc, char *argv [])
+{
+    int verbose = (argc &gt; 1 &amp;&amp; streq (argv [1], "-v"));
+
+    zctx_t *ctx = zctx_new ();
+
+    //  Prepare server socket with predictable identity
+    char *bind_endpoint = "tcp://*:5555";
+    char *connect_endpoint = "tcp://localhost:5555";
+    void *server = zsocket_new (ctx, ZMQ_ROUTER);
+    zmq_setsockopt (server,
+        ZMQ_IDENTITY, connect_endpoint, strlen (connect_endpoint));
+    zsocket_bind (server, bind_endpoint);
+    printf ("I: service is ready at %s\n", bind_endpoint);
+
+    while (!zctx_interrupted) {
+        zmsg_t *request = zmsg_recv (server);
+        if (verbose &amp;&amp; request)
+            zmsg_dump (request);
+        if (!request)
+            break;          //  Interrupted
+
+        //  Frame 0: identity of client
+        //  Frame 1: PING, or client control frame
+        //  Frame 2: request body
+        zframe_t *identity = zmsg_pop (request);
+        zframe_t *control = zmsg_pop (request);
+        zmsg_t *reply = zmsg_new ();
+        if (zframe_streq (control, "PING"))
+            zmsg_addstr (reply, "PONG");
+        else {
+            zmsg_add (reply, control);
+            zmsg_addstr (reply, "OK");
+        }
+        zmsg_destroy (&amp;request);
+        zmsg_push (reply, identity);
+        if (verbose &amp;&amp; reply)
+            zmsg_dump (reply);
+        zmsg_send (&amp;reply, server);
+    }
+    if (zctx_interrupted)
+        printf ("W: interrupted\n");
+
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>The Freelance client, however, has gotten large. For clarity, it's split into an example application and a class that does the hard work. Here's the top-level application:</p><div class="example"><a id="flclient3-c"></a><p class="title"><strong>Example 4.85. Freelance client, Model Three (flclient3.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Freelance client - Model 3
+//  Uses flcliapi class to encapsulate Freelance pattern
+
+//  Lets us build this source without creating a library
+#include "flcliapi.c"
+
+int main (void)
+{
+    //  Create new freelance client object
+    flcliapi_t *client = flcliapi_new ();
+
+    //  Connect to several endpoints
+    flcliapi_connect (client, "tcp://localhost:5555");
+    flcliapi_connect (client, "tcp://localhost:5556");
+    flcliapi_connect (client, "tcp://localhost:5557");
+
+    //  Send a bunch of name resolution 'requests', measure time
+    int requests = 1000;
+    uint64_t start = zclock_time ();
+    while (requests--) {
+        zmsg_t *request = zmsg_new ();
+        zmsg_addstr (request, "random name");
+        zmsg_t *reply = flcliapi_request (client, &amp;request);
+        if (!reply) {
+            printf ("E: name service not available, aborting\n");
+            break;
+        }
+        zmsg_destroy (&amp;reply);
+    }
+    printf ("Average round trip cost: %d usec\n",
+        (int) (zclock_time () - start) / 10);
+
+    flcliapi_destroy (&amp;client);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>And here, almost as complex and large as the Majordomo broker, is the client API class:</p><div class="example"><a id="flcliapi-c"></a><p class="title"><strong>Example 4.86. Freelance client API (flcliapi.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  flcliapi class - Freelance Pattern agent class
+//  Implements the Freelance Protocol at http://rfc.zeromq.org/spec:10
+
+#include "flcliapi.h"
+
+//  If no server replies within this time, abandon request
+#define GLOBAL_TIMEOUT  3000    //  msecs
+//  PING interval for servers we think are alive
+#define PING_INTERVAL   2000    //  msecs
+//  Server considered dead if silent for this long
+#define SERVER_TTL      6000    //  msecs
+</pre></div></div><br class="example-break" /><p>This API works in two halves, a common pattern for APIs that need to run in the background. One half is an frontend object our application creates and works with; the other half is a backend "agent" that runs in a background thread. The frontend talks to the backend over an inproc pipe socket: 
+</p><div class="example"><a id="flcliapi-c-1"></a><p class="title"><strong>Example 4.87. Freelance client API (flcliapi.c) - API structure</strong></p><div class="example-contents"><pre class="programlisting">
+
+//  Structure of our frontend class
+
+struct _flcliapi_t {
+    zctx_t *ctx;        //  Our context wrapper
+    void *pipe;         //  Pipe through to flcliapi agent
+};
+
+//  This is the thread that handles our real flcliapi class
+static void flcliapi_agent (void *args, zctx_t *ctx, void *pipe);
+
+//  Constructor
+
+flcliapi_t *
+flcliapi_new (void)
+{
+    flcliapi_t
+        *self;
+
+    self = (flcliapi_t *) zmalloc (sizeof (flcliapi_t));
+    self-&gt;ctx = zctx_new ();
+    self-&gt;pipe = zthread_fork (self-&gt;ctx, flcliapi_agent, NULL);
+    return self;
+}
+
+//  Destructor
+
+void
+flcliapi_destroy (flcliapi_t **self_p)
+{
+    assert (self_p);
+    if (*self_p) {
+        flcliapi_t *self = *self_p;
+        zctx_destroy (&amp;self-&gt;ctx);
+        free (self);
+        *self_p = NULL;
+    }
+}
+</pre></div></div><br class="example-break" /><p>To implement the connect method, the frontend object sends a multipart message to the backend agent. The first part is a string "CONNECT", and the second part is the endpoint. It waits 100msec for the connection to come up, which isn't pretty, but saves us from sending all requests to a single server, at startup time: 
+</p><div class="example"><a id="flcliapi-c-2"></a><p class="title"><strong>Example 4.88. Freelance client API (flcliapi.c) - connect method</strong></p><div class="example-contents"><pre class="programlisting">
+
+void
+flcliapi_connect (flcliapi_t *self, char *endpoint)
+{
+    assert (self);
+    assert (endpoint);
+    zmsg_t *msg = zmsg_new ();
+    zmsg_addstr (msg, "CONNECT");
+    zmsg_addstr (msg, endpoint);
+    zmsg_send (&amp;msg, self-&gt;pipe);
+    zclock_sleep (100);      //  Allow connection to come up
+}
+</pre></div></div><br class="example-break" /><p>To implement the request method, the frontend object sends a message to the backend, specifying a command "REQUEST" and the request message: 
+</p><div class="example"><a id="flcliapi-c-3"></a><p class="title"><strong>Example 4.89. Freelance client API (flcliapi.c) - request method</strong></p><div class="example-contents"><pre class="programlisting">
+
+zmsg_t *
+flcliapi_request (flcliapi_t *self, zmsg_t **request_p)
+{
+    assert (self);
+    assert (*request_p);
+
+    zmsg_pushstr (*request_p, "REQUEST");
+    zmsg_send (request_p, self-&gt;pipe);
+    zmsg_t *reply = zmsg_recv (self-&gt;pipe);
+    if (reply) {
+        char *status = zmsg_popstr (reply);
+        if (streq (status, "FAILED"))
+            zmsg_destroy (&amp;reply);
+        free (status);
+    }
+    return reply;
+}
+</pre></div></div><br class="example-break" /><p>Here we see the backend agent. It runs as an attached thread, talking to its parent over a pipe socket. It is a fairly complex piece of work so we'll break it down into pieces. First, the agent manages a set of servers, using our familiar class approach: 
+</p><div class="example"><a id="flcliapi-c-4"></a><p class="title"><strong>Example 4.90. Freelance client API (flcliapi.c) - backend agent</strong></p><div class="example-contents"><pre class="programlisting">
+
+//  Simple class for one server we talk to
+
+typedef struct {
+    char *endpoint;             //  Server identity/endpoint
+    uint alive;                 //  1 if known to be alive
+    int64_t ping_at;            //  Next ping at this time
+    int64_t expires;            //  Expires at this time
+} server_t;
+
+server_t *
+server_new (char *endpoint)
+{
+    server_t *self = (server_t *) zmalloc (sizeof (server_t));
+    self-&gt;endpoint = strdup (endpoint);
+    self-&gt;alive = 0;
+    self-&gt;ping_at = zclock_time () + PING_INTERVAL;
+    self-&gt;expires = zclock_time () + SERVER_TTL;
+    return self;
+}
+
+void
+server_destroy (server_t **self_p)
+{
+    assert (self_p);
+    if (*self_p) {
+        server_t *self = *self_p;
+        free (self-&gt;endpoint);
+        free (self);
+        *self_p = NULL;
+    }
+}
+
+int
+server_ping (const char *key, void *server, void *socket)
+{
+    server_t *self = (server_t *) server;
+    if (zclock_time () &gt;= self-&gt;ping_at) {
+        zmsg_t *ping = zmsg_new ();
+        zmsg_addstr (ping, self-&gt;endpoint);
+        zmsg_addstr (ping, "PING");
+        zmsg_send (&amp;ping, socket);
+        self-&gt;ping_at = zclock_time () + PING_INTERVAL;
+    }
+    return 0;
+}
+
+int
+server_tickless (const char *key, void *server, void *arg)
+{
+    server_t *self = (server_t *) server;
+    uint64_t *tickless = (uint64_t *) arg;
+    if (*tickless &gt; self-&gt;ping_at)
+        *tickless = self-&gt;ping_at;
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>We build the agent as a class that's capable of processing messages coming in from its various sockets: 
+</p><div class="example"><a id="flcliapi-c-5"></a><p class="title"><strong>Example 4.91. Freelance client API (flcliapi.c) - backend agent class</strong></p><div class="example-contents"><pre class="programlisting">
+
+//  Simple class for one background agent
+
+typedef struct {
+    zctx_t *ctx;                //  Own context
+    void *pipe;                 //  Socket to talk back to application
+    void *router;               //  Socket to talk to servers
+    zhash_t *servers;           //  Servers we've connected to
+    zlist_t *actives;           //  Servers we know are alive
+    uint sequence;              //  Number of requests ever sent
+    zmsg_t *request;            //  Current request if any
+    zmsg_t *reply;              //  Current reply if any
+    int64_t expires;            //  Timeout for request/reply
+} agent_t;
+
+agent_t *
+agent_new (zctx_t *ctx, void *pipe)
+{
+    agent_t *self = (agent_t *) zmalloc (sizeof (agent_t));
+    self-&gt;ctx = ctx;
+    self-&gt;pipe = pipe;
+    self-&gt;router = zsocket_new (self-&gt;ctx, ZMQ_ROUTER);
+    self-&gt;servers = zhash_new ();
+    self-&gt;actives = zlist_new ();
+    return self;
+}
+
+void
+agent_destroy (agent_t **self_p)
+{
+    assert (self_p);
+    if (*self_p) {
+        agent_t *self = *self_p;
+        zhash_destroy (&amp;self-&gt;servers);
+        zlist_destroy (&amp;self-&gt;actives);
+        zmsg_destroy (&amp;self-&gt;request);
+        zmsg_destroy (&amp;self-&gt;reply);
+        free (self);
+        *self_p = NULL;
+    }
+}
+</pre></div></div><br class="example-break" /><p>This method processes one message from our frontend class (it's going to be CONNECT or REQUEST): 
+</p><div class="example"><a id="flcliapi-c-6"></a><p class="title"><strong>Example 4.92. Freelance client API (flcliapi.c) - control messages</strong></p><div class="example-contents"><pre class="programlisting">
+
+//  Callback when we remove server from agent 'servers' hash table
+
+static void
+s_server_free (void *argument)
+{
+    server_t *server = (server_t *) argument;
+    server_destroy (&amp;server);
+}
+
+void
+agent_control_message (agent_t *self)
+{
+    zmsg_t *msg = zmsg_recv (self-&gt;pipe);
+    char *command = zmsg_popstr (msg);
+
+    if (streq (command, "CONNECT")) {
+        char *endpoint = zmsg_popstr (msg);
+        printf ("I: connecting to %s...\n", endpoint);
+        int rc = zmq_connect (self-&gt;router, endpoint);
+        assert (rc == 0);
+        server_t *server = server_new (endpoint);
+        zhash_insert (self-&gt;servers, endpoint, server);
+        zhash_freefn (self-&gt;servers, endpoint, s_server_free);
+        zlist_append (self-&gt;actives, server);
+        server-&gt;ping_at = zclock_time () + PING_INTERVAL;
+        server-&gt;expires = zclock_time () + SERVER_TTL;
+        free (endpoint);
+    }
+    else
+    if (streq (command, "REQUEST")) {
+        assert (!self-&gt;request);    //  Strict request-reply cycle
+        //  Prefix request with sequence number and empty envelope
+        char sequence_text [10];
+        sprintf (sequence_text, "%u", ++self-&gt;sequence);
+        zmsg_pushstr (msg, sequence_text);
+        //  Take ownership of request message
+        self-&gt;request = msg;
+        msg = NULL;
+        //  Request expires after global timeout
+        self-&gt;expires = zclock_time () + GLOBAL_TIMEOUT;
+    }
+    free (command);
+    zmsg_destroy (&amp;msg);
+}
+</pre></div></div><br class="example-break" /><p>This method processes one message from a connected server: 
+</p><div class="example"><a id="flcliapi-c-7"></a><p class="title"><strong>Example 4.93. Freelance client API (flcliapi.c) - router messages</strong></p><div class="example-contents"><pre class="programlisting">
+
+void
+agent_router_message (agent_t *self)
+{
+    zmsg_t *reply = zmsg_recv (self-&gt;router);
+
+    //  Frame 0 is server that replied
+    char *endpoint = zmsg_popstr (reply);
+    server_t *server =
+        (server_t *) zhash_lookup (self-&gt;servers, endpoint);
+    assert (server);
+    free (endpoint);
+    if (!server-&gt;alive) {
+        zlist_append (self-&gt;actives, server);
+        server-&gt;alive = 1;
+    }
+    server-&gt;ping_at = zclock_time () + PING_INTERVAL;
+    server-&gt;expires = zclock_time () + SERVER_TTL;
+
+    //  Frame 1 may be sequence number for reply
+    char *sequence = zmsg_popstr (reply);
+    if (atoi (sequence) == self-&gt;sequence) {
+        zmsg_pushstr (reply, "OK");
+        zmsg_send (&amp;reply, self-&gt;pipe);
+        zmsg_destroy (&amp;self-&gt;request);
+    }
+    else
+        zmsg_destroy (&amp;reply);
+}
+</pre></div></div><br class="example-break" /><p>Finally, here's the agent task itself, which polls its two sockets and processes incoming messages: 
+</p><div class="example"><a id="flcliapi-c-8"></a><p class="title"><strong>Example 4.94. Freelance client API (flcliapi.c) - backend agent implementation</strong></p><div class="example-contents"><pre class="programlisting">
+
+static void
+flcliapi_agent (void *args, zctx_t *ctx, void *pipe)
+{
+    agent_t *self = agent_new (ctx, pipe);
+
+    zmq_pollitem_t items [] = {
+        { self-&gt;pipe, 0, ZMQ_POLLIN, 0 },
+        { self-&gt;router, 0, ZMQ_POLLIN, 0 }
+    };
+    while (!zctx_interrupted) {
+        //  Calculate tickless timer, up to 1 hour
+        uint64_t tickless = zclock_time () + 1000 * 3600;
+        if (self-&gt;request
+        &amp;&amp;  tickless &gt; self-&gt;expires)
+            tickless = self-&gt;expires;
+        zhash_foreach (self-&gt;servers, server_tickless, &amp;tickless);
+
+        int rc = zmq_poll (items, 2,
+            (tickless - zclock_time ()) * ZMQ_POLL_MSEC);
+        if (rc == -1)
+            break;              //  Context has been shut down
+
+        if (items [0].revents &amp; ZMQ_POLLIN)
+            agent_control_message (self);
+
+        if (items [1].revents &amp; ZMQ_POLLIN)
+            agent_router_message (self);
+
+        //  If we're processing a request, dispatch to next server
+        if (self-&gt;request) {
+            if (zclock_time () &gt;= self-&gt;expires) {
+                //  Request expired, kill it
+                zstr_send (self-&gt;pipe, "FAILED");
+                zmsg_destroy (&amp;self-&gt;request);
+            }
+            else {
+                //  Find server to talk to, remove any expired ones
+                while (zlist_size (self-&gt;actives)) {
+                    server_t *server =
+                        (server_t *) zlist_first (self-&gt;actives);
+                    if (zclock_time () &gt;= server-&gt;expires) {
+                        zlist_pop (self-&gt;actives);
+                        server-&gt;alive = 0;
+                    }
+                    else {
+                        zmsg_t *request = zmsg_dup (self-&gt;request);
+                        zmsg_pushstr (request, server-&gt;endpoint);
+                        zmsg_send (&amp;request, self-&gt;router);
+                        break;
+                    }
+                }
+            }
+        }
+        //  Disconnect and delete any expired servers
+        //  Send heartbeats to idle servers if needed
+        zhash_foreach (self-&gt;servers, server_ping, self-&gt;router);
+    }
+    agent_destroy (&amp;self);
+}
+</pre></div></div><br class="example-break" /><p>This API implementation is fairly sophisticated and uses a couple of techniques that we've not seen before.</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p><span class="bold"><strong>Multithreaded API</strong></span>: the client API consists of two parts, a synchronous <code class="literal">flcliapi</code> class that runs in the application thread, and an asynchronous <span class="emphasis"><em>agent</em></span> class that runs as a background thread. Remember how ØMQ makes it easy to create multithreaded apps. The flcliapi and agent classes talk to each other with messages over an <code class="literal">inproc</code> socket. All ØMQ aspects (such as creating and destroying a context) are hidden in the API. The agent in effect acts like a mini-broker, talking to servers in the background, so that when we make a request, it can make a best effort to reach a server it believes is available.</p></li><li class="listitem"><p><span class="bold"><strong>Tickless poll timer</strong></span>: in previous poll loops we always used a fixed tick interval, e.g., 1 second, which is simple enough but not excellent on power-sensitive clients (such as notebooks or mobile phones), where waking the CPU costs power. For fun, and to help save the planet, the agent uses a <span class="emphasis"><em>tickless timer</em></span>, which calculates the poll delay based on the next timeout we're expecting. A proper implementation would keep an ordered list of timeouts. We just check all timeouts and calculate the poll delay until the next one.</p></li></ul></div></div></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch04s13.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch04.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch04s15.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">High-Availability Pair (Binary Star Pattern) </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Conclusion</td></tr></table></div></body></html>

@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Node Coordination</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch02.html" title="Chapter 2. Sockets and Patterns" /><link rel="prev" href="ch02s07.html" title="Signaling Between Threads (PAIR Sockets)" /><link rel="next" href="ch02s09.html" title="Zero-Copy" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Node Coordination</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch02s07.html">Prev</a> </td><th width="60%" align="center">Chapter 2. Sockets and Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch02s09.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Node Coordination"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp19313160"></a>Node Coordination</h2></div></div></div><p>When you want to coordinate a set of nodes on a network, PAIR sockets won't work well any more. This is one of the few areas where the strategies for threads and nodes are different. Principally, nodes come and go whereas threads are usually static. PAIR sockets do not automatically reconnect if the remote node goes away and comes back.</p><div class="figure"><a id="figure-22"></a><p class="title"><strong>Figure 2.14. Pub-Sub Synchronization</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig22.png" alt="Pub-Sub Synchronization" /></div></div></div><br class="figure-break" /><p>The second significant difference between threads and nodes is that you typically have a fixed number of threads but a more variable number of nodes. Let's take one of our earlier scenarios (the weather server and clients) and use node coordination to ensure that subscribers don't lose data when starting up.</p><p>This is how the application will work:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The publisher knows in advance how many subscribers it expects. This is just a magic number it gets from somewhere.</p></li><li class="listitem"><p>The publisher starts up and waits for all subscribers to connect. This is the node coordination part. Each subscriber subscribes and then tells the publisher it's ready via another socket.</p></li><li class="listitem"><p>When the publisher has all subscribers connected, it starts to publish data.</p></li></ul></div><p>In this case, we'll use a REQ-REP socket flow to synchronize subscribers and publisher<a class="xref" href="ch02s10.html#figure-23" title="Figure 2.15. Pub-Sub Envelope with Separate Key">Figure 2.15, “Pub-Sub Envelope with Separate Key”</a>. Here is the publisher:</p><div class="example"><a id="syncpub-c"></a><p class="title"><strong>Example 2.13. Synchronized publisher (syncpub.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Synchronized publisher
+
+#include "zhelpers.h"
+#define SUBSCRIBERS_EXPECTED  10  //  We wait for 10 subscribers 
+
+int main (void)
+{
+    void *context = zmq_ctx_new ();
+
+    //  Socket to talk to clients
+    void *publisher = zmq_socket (context, ZMQ_PUB);
+
+    int sndhwm = 1100000;
+    zmq_setsockopt (publisher, ZMQ_SNDHWM, &amp;sndhwm, sizeof (int));
+
+    zmq_bind (publisher, "tcp://*:5561");
+
+    //  Socket to receive signals
+    void *syncservice = zmq_socket (context, ZMQ_REP);
+    zmq_bind (syncservice, "tcp://*:5562");
+
+    //  Get synchronization from subscribers
+    printf ("Waiting for subscribers\n");
+    int subscribers = 0;
+    while (subscribers &lt; SUBSCRIBERS_EXPECTED) {
+        //  - wait for synchronization request
+        char *string = s_recv (syncservice);
+        free (string);
+        //  - send synchronization reply
+        s_send (syncservice, "");
+        subscribers++;
+    }
+    //  Now broadcast exactly 1M updates followed by END
+    printf ("Broadcasting messages\n");
+    int update_nbr;
+    for (update_nbr = 0; update_nbr &lt; 1000000; update_nbr++)
+        s_send (publisher, "Rhubarb");
+
+    s_send (publisher, "END");
+
+    zmq_close (publisher);
+    zmq_close (syncservice);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>And here is the subscriber:</p><div class="example"><a id="syncsub-c"></a><p class="title"><strong>Example 2.14. Synchronized subscriber (syncsub.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Synchronized subscriber
+
+#include "zhelpers.h"
+
+int main (void)
+{
+    void *context = zmq_ctx_new ();
+
+    //  First, connect our subscriber socket
+    void *subscriber = zmq_socket (context, ZMQ_SUB);
+    zmq_connect (subscriber, "tcp://localhost:5561");
+    zmq_setsockopt (subscriber, ZMQ_SUBSCRIBE, "", 0);
+
+    //  0MQ is so fast, we need to wait a while...
+    sleep (1);
+
+    //  Second, synchronize with publisher
+    void *syncclient = zmq_socket (context, ZMQ_REQ);
+    zmq_connect (syncclient, "tcp://localhost:5562");
+
+    //  - send a synchronization request
+    s_send (syncclient, "");
+
+    //  - wait for synchronization reply
+    char *string = s_recv (syncclient);
+    free (string);
+
+    //  Third, get our updates and report how many we got
+    int update_nbr = 0;
+    while (1) {
+        char *string = s_recv (subscriber);
+        if (strcmp (string, "END") == 0) {
+            free (string);
+            break;
+        }
+        free (string);
+        update_nbr++;
+    }
+    printf ("Received %d updates\n", update_nbr);
+
+    zmq_close (subscriber);
+    zmq_close (syncclient);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>This Bash shell script will start ten subscribers and then the publisher:</p><pre class="screen">echo "Starting subscribers..."
+for ((a=0; a&lt;10; a++)); do
+    syncsub &amp;
+done
+echo "Starting publisher..."
+syncpub
+</pre><p>Which gives us this satisfying output:</p><pre class="screen">Starting subscribers...
+Starting publisher...
+Received 1000000 updates
+Received 1000000 updates
+...
+Received 1000000 updates
+Received 1000000 updates
+</pre><p>We can't assume that the SUB connect will be finished by the time the REQ/REP dialog is complete. There are no guarantees that outbound connects will finish in any order whatsoever, if you're using any transport except <code class="literal">inproc</code>. So, the example does a brute force sleep of one second between subscribing, and sending the REQ/REP synchronization.</p><p>A more robust model could be:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Publisher opens PUB socket and starts sending "Hello" messages (not data).</p></li><li class="listitem"><p>Subscribers connect SUB socket and when they receive a Hello message they tell the publisher via a REQ/REP socket pair.</p></li><li class="listitem"><p>When the publisher has had all the necessary confirmations, it starts to send real data.</p></li></ul></div></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch02s07.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch02.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch02s09.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Signaling Between Threads (PAIR Sockets) </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Zero-Copy</td></tr></table></div></body></html>

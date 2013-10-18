@@ -1,0 +1,284 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>The Load Balancing Pattern</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch03.html" title="Chapter 3. Advanced Request-Reply Patterns" /><link rel="prev" href="ch03s03.html" title="Exploring ROUTER Sockets" /><link rel="next" href="ch03s05.html" title="A High-Level API for ØMQ" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">The Load Balancing Pattern</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch03s03.html">Prev</a> </td><th width="60%" align="center">Chapter 3. Advanced Request-Reply Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch03s05.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="The Load Balancing Pattern"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp19427056"></a>The Load Balancing Pattern</h2></div></div></div><p>Now let's look at some code. We'll see how to connect a ROUTER socket to a REQ socket, and then to a DEALER socket. These two examples follow the same logic, which is a <span class="emphasis"><em>load balancing</em></span> pattern. This pattern is our first exposure to using the ROUTER socket for deliberate routing, rather than simply acting as a reply channel.</p><p>The load balancing pattern is very common and we'll see it several times in this book. It solves the main problem with simple round robin routing (as PUSH and DEALER offer) which is that round robin becomes inefficient if tasks do not all roughly take the same time.</p><p>It's the post office analogy. If you have one queue per counter, and you have some people buying stamps (a fast, simple transaction), and some people opening new accounts (a very slow transaction), then you will find stamp buyers getting unfairly stuck in queues. Just as in a post office, if your messaging architecture is unfair, people will get annoyed.</p><p>The solution in the post office is to create a single queue so that even if one or two counters get stuck with slow work, other counters will continue to serve clients on a first-come, first-serve basis.</p><p>One reason PUSH and DEALER use the simplistic approach is sheer performance. If you arrive in any major US airport, you'll find long queues of people waiting at immigration. The border patrol officials will send people in advance to queue up at each counter, rather than using a single queue. Having people walk fifty yards in advance saves a minute or two per passenger. And because every passport check takes roughly the same time, it's more or less fair. This is the strategy for PUSH and DEALER: send work loads ahead of time so that there is less travel distance.</p><p>This is a recurring theme with ØMQ: the world's problems are diverse and you can benefit from solving different problems each in the right way. The airport isn't the post office and one size fits no one, really well.</p><p>Let's return to the scenario of a worker (DEALER or REQ) connected to a broker (ROUTER). The broker has to know when the worker is ready, and keep a list of workers so that it can take the <span class="emphasis"><em>least recently used</em></span> worker each time.</p><p>The solution is really simple, in fact: workers send a "ready" message when they start, and after they finish each task. The broker reads these messages one-by-one. Each time it reads a message, it is from the last used worker. And because we're using a ROUTER socket, we get an identity that we can then use to send a task back to the worker.</p><p>It's a twist on request-reply because the task is sent with the reply, and any response for the task is sent as a new request. The following code examples should make it clearer.</p><div class="sect2" title="ROUTER Broker and REQ Workers"><div class="titlepage"><div><div><h3 class="title"><a id="idp19432240"></a>ROUTER Broker and REQ Workers</h3></div></div></div><p>Here is an example of the load balancing pattern using a ROUTER broker talking to a set of REQ workers:</p><div class="example"><a id="rtreq-c"></a><p class="title"><strong>Example 3.2. ROUTER-to-REQ (rtreq.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  ROUTER-to-REQ example
+
+#include "zhelpers.h"
+#include &lt;pthread.h&gt;
+#define NBR_WORKERS 10
+
+static void *
+worker_task (void *args)
+{
+    void *context = zmq_ctx_new ();
+    void *worker = zmq_socket (context, ZMQ_REQ);
+    s_set_id (worker);          //  Set a printable identity
+    zmq_connect (worker, "tcp://localhost:5671");
+
+    int total = 0;
+    while (1) {
+        //  Tell the broker we're ready for work
+        s_send (worker, "Hi Boss");
+
+        //  Get workload from broker, until finished
+        char *workload = s_recv (worker);
+        int finished = (strcmp (workload, "Fired!") == 0);
+        free (workload);
+        if (finished) {
+            printf ("Completed: %d tasks\n", total);
+            break;
+        }
+        total++;
+
+        //  Do some random work
+        s_sleep (randof (500) + 1);
+    }
+    zmq_close (worker);
+    zmq_ctx_destroy (context);
+    return NULL;
+}
+</pre></div></div><br class="example-break" /><p>While this example runs in a single process, that is only to make it easier to start and stop the example. Each thread has its own context and conceptually acts as a separate process. 
+</p><div class="example"><a id="rtreq-c-1"></a><p class="title"><strong>Example 3.3. ROUTER-to-REQ (rtreq.c) - main task</strong></p><div class="example-contents"><pre class="programlisting">
+
+int main (void)
+{
+    void *context = zmq_ctx_new ();
+    void *broker = zmq_socket (context, ZMQ_ROUTER);
+
+    zmq_bind (broker, "tcp://*:5671");
+    srandom ((unsigned) time (NULL));
+
+    int worker_nbr;
+    for (worker_nbr = 0; worker_nbr &lt; NBR_WORKERS; worker_nbr++) {
+        pthread_t worker;
+        pthread_create (&amp;worker, NULL, worker_task, NULL);
+    }
+    //  Run for five seconds and then tell workers to end
+    int64_t end_time = s_clock () + 5000;
+    int workers_fired = 0;
+    while (1) {
+        //  Next message gives us least recently used worker
+        char *identity = s_recv (broker);
+        s_sendmore (broker, identity);
+        free (identity);
+        free (s_recv (broker));     //  Envelope delimiter
+        free (s_recv (broker));     //  Response from worker
+        s_sendmore (broker, "");
+
+        //  Encourage workers until it's time to fire them
+        if (s_clock () &lt; end_time)
+            s_send (broker, "Work harder");
+        else {
+            s_send (broker, "Fired!");
+            if (++workers_fired == NBR_WORKERS)
+                break;
+        }
+    }
+    zmq_close (broker);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>The example runs for five seconds and then each worker prints how many tasks they handled. If the routing worked, we'd expect a fair distribution of work:</p><pre class="screen">Completed: 20 tasks
+Completed: 18 tasks
+Completed: 21 tasks
+Completed: 23 tasks
+Completed: 19 tasks
+Completed: 21 tasks
+Completed: 17 tasks
+Completed: 17 tasks
+Completed: 25 tasks
+Completed: 19 tasks
+</pre><p>To talk to the workers in this example, we have to create a REQ-friendly envelope consisting of an identity plus an empty envelope delimiter frame<a class="xref" href="ch03s04.html#figure-31" title="Figure 3.6. Routing Envelope for REQ">Figure 3.6, “Routing Envelope for REQ”</a>.</p><div class="figure"><a id="figure-31"></a><p class="title"><strong>Figure 3.6. Routing Envelope for REQ</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig31.png" alt="Routing Envelope for REQ" /></div></div></div><br class="figure-break" /></div><div class="sect2" title="ROUTER Broker and DEALER Workers"><div class="titlepage"><div><div><h3 class="title"><a id="idp19442024"></a>ROUTER Broker and DEALER Workers</h3></div></div></div><p>Anywhere you can use REQ, you can use DEALER. There are two specific differences:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The REQ socket always sends an empty delimiter frame before any data frames; the DEALER does not.</p></li><li class="listitem"><p>The REQ socket will send only one message before it receives a reply; the DEALER is fully asynchronous.</p></li></ul></div><p>The synchronous versus asynchronous behavior has no effect on our example because we're doing strict request-reply. It is more relevant when we address recovering from failures, which we'll come to in Reliable Request-Reply Patterns<a class="xref" href="ch04.html" title="Chapter 4. Reliable Request-Reply Patterns">Chapter 4, <em>Reliable Request-Reply Patterns</em></a>.</p><p>Now let's look at exactly the same example but with the REQ socket replaced by a DEALER socket:</p><div class="example"><a id="rtdealer-c"></a><p class="title"><strong>Example 3.4. ROUTER-to-DEALER (rtdealer.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  ROUTER-to-DEALER example
+
+#include "zhelpers.h"
+#include &lt;pthread.h&gt;
+#define NBR_WORKERS 10
+
+static void *
+worker_task (void *args)
+{
+    void *context = zmq_ctx_new ();
+    void *worker = zmq_socket (context, ZMQ_DEALER);
+    s_set_id (worker);          //  Set a printable identity
+    zmq_connect (worker, "tcp://localhost:5671");
+
+    int total = 0;
+    while (1) {
+        //  Tell the broker we're ready for work
+        s_sendmore (worker, "");
+        s_send (worker, "Hi Boss");
+
+        //  Get workload from broker, until finished
+        free (s_recv (worker));     //  Envelope delimiter
+        char *workload = s_recv (worker);
+...
+</pre></div></div><br class="example-break" /><p>The code is almost identical except that the worker uses a DEALER socket, and reads and writes that empty frame before the data frame. This is the approach I use when I want to keep compatibility with REQ workers.</p><p>However, remember the reason for that empty delimiter frame: it's to allow multihop extended requests that terminate in a REP socket, which uses that delimiter to split off the reply envelope so it can hand the data frames to its application.</p><p>If we never need to pass the message along to a REP socket, we can simply drop the empty delimiter frame at both sides, which makes things simpler. This is usually the design I use for pure DEALER to ROUTER protocols.</p></div><div class="sect2" title="A Load Balancing Message Broker"><div class="titlepage"><div><div><h3 class="title"><a id="idp19448296"></a>A Load Balancing Message Broker</h3></div></div></div><p>The previous example is half-complete. It can manage a set of workers with dummy requests and replies, but it has no way to talk to clients. If we add a second <span class="emphasis"><em>frontend</em></span> ROUTER socket that accepts client requests, and turn our example into a proxy that can switch messages from frontend to backend, we get a useful and reusable tiny load balancing message broker<a class="xref" href="ch03s04.html#figure-32" title="Figure 3.7. Load Balancing Broker">Figure 3.7, “Load Balancing Broker”</a>.</p><div class="figure"><a id="figure-32"></a><p class="title"><strong>Figure 3.7. Load Balancing Broker</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig32.png" alt="Load Balancing Broker" /></div></div></div><br class="figure-break" /><p>This broker does the following:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Accepts connections from a set of clients.</p></li><li class="listitem"><p>Accepts connections from a set of workers.</p></li><li class="listitem"><p>Accepts requests from clients and holds these in a single queue.</p></li><li class="listitem"><p>Sends these requests to workers using the load balancing pattern.</p></li><li class="listitem"><p>Receives replies back from workers.</p></li><li class="listitem"><p>Sends these replies back to the original requesting client.</p></li></ul></div><p>The broker code is fairly long, but worth understanding:</p><div class="example"><a id="lbbroker-c"></a><p class="title"><strong>Example 3.5. Load balancing broker (lbbroker.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Load-balancing broker
+//  Clients and workers are shown here in-process
+
+#include "zhelpers.h"
+#include &lt;pthread.h&gt;
+#define NBR_CLIENTS 10
+#define NBR_WORKERS 3
+
+//  Dequeue operation for queue implemented as array of anything
+#define DEQUEUE(q) memmove (&amp;(q)[0], &amp;(q)[1], sizeof (q) - sizeof (q [0]))
+
+//  Basic request-reply client using REQ socket
+//  Because s_send and s_recv can't handle 0MQ binary identities, we
+//  set a printable text identity to allow routing.
+//
+static void *
+client_task (void *args)
+{
+    void *context = zmq_ctx_new ();
+    void *client = zmq_socket (context, ZMQ_REQ);
+    s_set_id (client);          //  Set a printable identity
+    zmq_connect (client, "ipc://frontend.ipc");
+
+    //  Send request, get reply
+    s_send (client, "HELLO");
+    char *reply = s_recv (client);
+    printf ("Client: %s\n", reply);
+    free (reply);
+    zmq_close (client);
+    zmq_ctx_destroy (context);
+    return NULL;
+}
+</pre></div></div><br class="example-break" /><p>While this example runs in a single process, that is just to make it easier to start and stop the example. Each thread has its own context and conceptually acts as a separate process. This is the worker task, using a REQ socket to do load-balancing. Because s_send and s_recv can't handle ØMQ binary identities, we set a printable text identity to allow routing. 
+</p><div class="example"><a id="lbbroker-c-1"></a><p class="title"><strong>Example 3.6. Load balancing broker (lbbroker.c) - worker task</strong></p><div class="example-contents"><pre class="programlisting">
+
+static void *
+worker_task (void *args)
+{
+    void *context = zmq_ctx_new ();
+    void *worker = zmq_socket (context, ZMQ_REQ);
+    s_set_id (worker);          //  Set a printable identity
+    zmq_connect (worker, "ipc://backend.ipc");
+
+    //  Tell broker we're ready for work
+    s_send (worker, "READY");
+
+    while (1) {
+        //  Read and save all frames until we get an empty frame
+        //  In this example there is only 1, but there could be more
+        char *identity = s_recv (worker);
+        char *empty = s_recv (worker);
+        assert (*empty == 0);
+        free (empty);
+
+        //  Get request, send reply
+        char *request = s_recv (worker);
+        printf ("Worker: %s\n", request);
+        free (request);
+
+        s_sendmore (worker, identity);
+        s_sendmore (worker, "");
+        s_send     (worker, "OK");
+        free (identity);
+    }
+    zmq_close (worker);
+    zmq_ctx_destroy (context);
+    return NULL;
+}
+</pre></div></div><br class="example-break" /><p>This is the main task. It starts the clients and workers, and then routes requests between the two layers. Workers signal READY when they start; after that we treat them as ready when they reply with a response back to a client. The load-balancing data structure is just a queue of next available workers. 
+</p><div class="example"><a id="lbbroker-c-2"></a><p class="title"><strong>Example 3.7. Load balancing broker (lbbroker.c) - main task</strong></p><div class="example-contents"><pre class="programlisting">
+
+int main (void)
+{
+    //  Prepare our context and sockets
+    void *context = zmq_ctx_new ();
+    void *frontend = zmq_socket (context, ZMQ_ROUTER);
+    void *backend  = zmq_socket (context, ZMQ_ROUTER);
+    zmq_bind (frontend, "ipc://frontend.ipc");
+    zmq_bind (backend,  "ipc://backend.ipc");
+
+    int client_nbr;
+    for (client_nbr = 0; client_nbr &lt; NBR_CLIENTS; client_nbr++) {
+        pthread_t client;
+        pthread_create (&amp;client, NULL, client_task, NULL);
+    }
+    int worker_nbr;
+    for (worker_nbr = 0; worker_nbr &lt; NBR_WORKERS; worker_nbr++) {
+        pthread_t worker;
+        pthread_create (&amp;worker, NULL, worker_task, NULL);
+    }
+</pre></div></div><br class="example-break" /><p>Here is the main loop for the least-recently-used queue. It has two sockets; a frontend for clients and a backend for workers. It polls the backend in all cases, and polls the frontend only when there are one or more workers ready. This is a neat way to use ØMQ's own queues to hold messages we're not ready to process yet. When we get a client reply, we pop the next available worker and send the request to it, including the originating client identity. When a worker replies, we requeue that worker and forward the reply to the original client using the reply envelope. 
+</p><div class="example"><a id="lbbroker-c-3"></a><p class="title"><strong>Example 3.8. Load balancing broker (lbbroker.c) - main task body</strong></p><div class="example-contents"><pre class="programlisting">
+    //  Queue of available workers
+    int available_workers = 0;
+    char *worker_queue [10];
+
+    while (1) {
+        zmq_pollitem_t items [] = {
+            { backend,  0, ZMQ_POLLIN, 0 },
+            { frontend, 0, ZMQ_POLLIN, 0 }
+        };
+        //  Poll frontend only if we have available workers
+        int rc = zmq_poll (items, available_workers ? 2 : 1, -1);
+        if (rc == -1)
+            break;              //  Interrupted
+
+        //  Handle worker activity on backend
+        if (items [0].revents &amp; ZMQ_POLLIN) {
+            //  Queue worker identity for load-balancing
+            char *worker_id = s_recv (backend);
+            assert (available_workers &lt; NBR_WORKERS);
+            worker_queue [available_workers++] = worker_id;
+
+            //  Second frame is empty
+            char *empty = s_recv (backend);
+            assert (empty [0] == 0);
+            free (empty);
+
+            //  Third frame is READY or else a client reply identity
+            char *client_id = s_recv (backend);
+
+            //  If client reply, send rest back to frontend
+            if (strcmp (client_id, "READY") != 0) {
+                empty = s_recv (backend);
+                assert (empty [0] == 0);
+                free (empty);
+                char *reply = s_recv (backend);
+                s_sendmore (frontend, client_id);
+                s_sendmore (frontend, "");
+                s_send     (frontend, reply);
+                free (reply);
+                if (--client_nbr == 0)
+                    break;      //  Exit after N messages
+            }
+            free (client_id);
+        }
+</pre></div></div><br class="example-break" /><p>Here is how we handle a client request: 
+</p><div class="example"><a id="lbbroker-c-4"></a><p class="title"><strong>Example 3.9. Load balancing broker (lbbroker.c) - handling a client request</strong></p><div class="example-contents"><pre class="programlisting">
+        if (items [1].revents &amp; ZMQ_POLLIN) {
+            //  Now get next client request, route to last-used worker
+            //  Client request is [identity][empty][request]
+            char *client_id = s_recv (frontend);
+            char *empty = s_recv (frontend);
+            assert (empty [0] == 0);
+            free (empty);
+            char *request = s_recv (frontend);
+
+            s_sendmore (backend, worker_queue [0]);
+            s_sendmore (backend, "");
+            s_sendmore (backend, client_id);
+            s_sendmore (backend, "");
+            s_send     (backend, request);
+
+            free (client_id);
+            free (request);
+
+            //  Dequeue and drop the next worker identity
+            free (worker_queue [0]);
+            DEQUEUE (worker_queue);
+            available_workers--;
+        }
+    }
+    zmq_close (frontend);
+    zmq_close (backend);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>The difficult part of this program is (a) the envelopes that each socket reads and writes, and (b) the load balancing algorithm. We'll take these in turn, starting with the message envelope formats.</p><p>Let's walk through a full request-reply chain from client to worker and back. In this code we set the identity of client and worker sockets to make it easier to trace the message frames. In reality, we'd allow the ROUTER sockets to invent identities for connections. Let's assume the client's identity is "CLIENT" and the worker's identity is "WORKER". The client application sends a single frame containing "Hello"<a class="xref" href="ch03s04.html#figure-33" title="Figure 3.8. Message that Client Sends">Figure 3.8, “Message that Client Sends”</a>.</p><div class="figure"><a id="figure-33"></a><p class="title"><strong>Figure 3.8. Message that Client Sends</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig33.png" alt="Message that Client Sends" /></div></div></div><br class="figure-break" /><p>Because the REQ socket adds its empty delimiter frame and the ROUTER socket adds its connection identity, the proxy reads off the frontend ROUTER socket the client address, empty delimiter frame, and the data part<a class="xref" href="ch03s04.html#figure-34" title="Figure 3.9. Message Coming in on Frontend">Figure 3.9, “Message Coming in on Frontend”</a>.</p><div class="figure"><a id="figure-34"></a><p class="title"><strong>Figure 3.9. Message Coming in on Frontend</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig34.png" alt="Message Coming in on Frontend" /></div></div></div><br class="figure-break" /><p>The broker sends this to the worker, prefixed by the address of the chosen worker, plus an additional empty part to keep the REQ at the other end happy<a class="xref" href="ch03s04.html#figure-35" title="Figure 3.10. Message Sent to Backend">Figure 3.10, “Message Sent to Backend”</a>.</p><div class="figure"><a id="figure-35"></a><p class="title"><strong>Figure 3.10. Message Sent to Backend</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig35.png" alt="Message Sent to Backend" /></div></div></div><br class="figure-break" /><p>This complex envelope stack gets chewed up first by the backend ROUTER socket, which removes the first frame. Then the REQ socket in the worker removes the empty part, and provides the rest to the worker application<a class="xref" href="ch03s04.html#figure-36" title="Figure 3.11. Message Delivered to Worker">Figure 3.11, “Message Delivered to Worker”</a>.</p><div class="figure"><a id="figure-36"></a><p class="title"><strong>Figure 3.11. Message Delivered to Worker</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig36.png" alt="Message Delivered to Worker" /></div></div></div><br class="figure-break" /><p>The worker has to save the envelope (which is all the parts up to and including the empty message frame) and then it can do what's needed with the data part. Note that a REP socket would do this automatically, but we're using the REQ-ROUTER pattern so that we can get proper load balancing.</p><p>On the return path, the messages are the same as when they come in, i.e., the backend socket gives the broker a message in five parts, and the broker sends the frontend socket a message in three parts, and the client gets a message in one part.</p><p>Now let's look at the load balancing algorithm. It requires that both clients and workers use REQ sockets, and that workers correctly store and replay the envelope on messages they get. The algorithm is:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Create a pollset that always polls the backend, and polls the frontend only if there are one or more workers available.</p></li><li class="listitem"><p>Poll for activity with infinite timeout.</p></li><li class="listitem"><p>If there is activity on the backend, we either have a "ready" message or a reply for a client. In either case, we store the worker address (the first part) on our worker queue, and if the rest is a client reply, we send it back to that client via the frontend.</p></li><li class="listitem"><p>If there is activity on the frontend, we take the client request, pop the next worker (which is the last used), and send the request to the backend. This means sending the worker address, empty part, and then the three parts of the client request.</p></li></ul></div><p>You should now see that you can reuse and extend the load balancing algorithm with variations based on the information the worker provides in its initial "ready" message. For example, workers might start up and do a performance self test, then tell the broker how fast they are. The broker can then choose the fastest available worker rather than the oldest.</p></div></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch03s03.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch03.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch03s05.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Exploring ROUTER Sockets </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> A High-Level API for ØMQ</td></tr></table></div></body></html>

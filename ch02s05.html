@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Detecting Memory Leaks</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch02.html" title="Chapter 2. Sockets and Patterns" /><link rel="prev" href="ch02s04.html" title="Handling Interrupt Signals" /><link rel="next" href="ch02s06.html" title="Multithreading with ØMQ" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Detecting Memory Leaks</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch02s04.html">Prev</a> </td><th width="60%" align="center">Chapter 2. Sockets and Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch02s06.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Detecting Memory Leaks"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp19268368"></a>Detecting Memory Leaks</h2></div></div></div><p>Any long-running application has to manage memory correctly, or eventually it'll use up all available memory and crash. If you use a language that handles this automatically for you, congratulations. If you program in C or C++ or any other language where you're responsible for memory management, here's a short tutorial on using valgrind, which among other things will report on any leaks your programs have.</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>To install valgrind, e.g., on Ubuntu or Debian, issue this command:</p></li></ul></div><pre class="screen">sudo apt-get install valgrind
+</pre><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>By default, ØMQ will cause valgrind to complain a lot. To remove these warnings, create a file called <code class="literal">vg.supp</code> that contains this:</p></li></ul></div><pre class="screen">{
+   &lt;socketcall_sendto&gt;
+   Memcheck:Param
+   socketcall.sendto(msg)
+   fun:send
+   ...
+}
+{
+   &lt;socketcall_sendto&gt;
+   Memcheck:Param
+   socketcall.send(msg)
+   fun:send
+   ...
+}
+</pre><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Fix your applications to exit cleanly after Ctrl-C. For any application that exits by itself, that's not needed, but for long-running applications, this is essential, otherwise valgrind will complain about all currently allocated memory.</p></li><li class="listitem"><p>Build your application with <code class="literal">-DDEBUG</code> if it's not your default setting. That ensures valgrind can tell you exactly where memory is being leaked.</p></li><li class="listitem"><p>Finally, run valgrind thus:</p></li></ul></div><pre class="screen">valgrind --tool=memcheck --leak-check=full --suppressions=vg.supp someprog
+</pre><p>And after fixing any errors it reported, you should get the pleasant message:</p><pre class="screen">==30536== ERROR SUMMARY: 0 errors from 0 contexts...
+</pre></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch02s04.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch02.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch02s06.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Handling Interrupt Signals </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Multithreading with ØMQ</td></tr></table></div></body></html>

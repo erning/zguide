@@ -1,0 +1,2123 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Reliable Pub-Sub (Clone Pattern)</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch05.html" title="Chapter 5. Advanced Pub-Sub Patterns" /><link rel="prev" href="ch05s05.html" title="High-Speed Subscribers (Black Box Pattern)" /><link rel="next" href="ch06.html" title="Chapter 6. The ØMQ Community" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Reliable Pub-Sub (Clone Pattern)</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch05s05.html">Prev</a> </td><th width="60%" align="center">Chapter 5. Advanced Pub-Sub Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch06.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Reliable Pub-Sub (Clone Pattern)"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp20240264"></a>Reliable Pub-Sub (Clone Pattern)</h2></div></div></div><p>As a larger worked example, we'll take the problem of making a reliable pub-sub architecture. We'll develop this in stages. The goal is to allow a set of applications to share some common state. Here are our technical challenges:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>We have a large set of client applications, say thousands or tens of thousands.</p></li><li class="listitem"><p>They will join and leave the network arbitrarily.</p></li><li class="listitem"><p>These applications must share a single eventually-consistent <span class="emphasis"><em>state</em></span>.</p></li><li class="listitem"><p>Any application can update the state at any point in time.</p></li></ul></div><p>Let's say that updates are reasonably low-volume. We don't have real time goals. The whole state can fit into memory. Some plausible use cases are:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>A configuration that is shared by a group of cloud servers.</p></li><li class="listitem"><p>Some game state shared by a group of players.</p></li><li class="listitem"><p>Exchange rate data that is updated in real time and available to applications.</p></li></ul></div><div class="sect2" title="Centralized Versus Decentralized"><div class="titlepage"><div><div><h3 class="title"><a id="idp20244256"></a>Centralized Versus Decentralized</h3></div></div></div><p>A first decision we have to make is whether we work with a central server or not. It makes a big difference in the resulting design. The trade-offs are these:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Conceptually, a central server is simpler to understand because networks are not naturally symmetrical. With a central server, we avoid all questions of discovery, bind versus connect, and so on.</p></li><li class="listitem"><p>Generally, a fully-distributed architecture is technically more challenging but ends up with simpler protocols. That is, each node must act as server and client in the right way, which is delicate. When done right, the results are simpler than using a central server. We saw this in the Freelance pattern in Reliable Request-Reply Patterns<a class="xref" href="ch04.html" title="Chapter 4. Reliable Request-Reply Patterns">Chapter 4, <em>Reliable Request-Reply Patterns</em></a>.</p></li><li class="listitem"><p>A central server will become a bottleneck in high-volume use cases. If handling scale in the order of millions of messages a second is required, we should aim for decentralization right away.</p></li><li class="listitem"><p>Ironically, a centralized architecture will scale to more nodes more easily than a decentralized one. That is, it's easier to connect 10,000 nodes to one server than to each other.</p></li></ul></div><p>So, for the Clone pattern we'll work with a <span class="emphasis"><em>server</em></span> that publishes state updates and a set of <span class="emphasis"><em>clients</em></span> that represent applications.</p></div><div class="sect2" title="Representing State as Key-Value Pairs"><div class="titlepage"><div><div><h3 class="title"><a id="idp20248160"></a>Representing State as Key-Value Pairs</h3></div></div></div><p>We'll develop Clone in stages, solving one problem at a time. First, let's look at how to update a shared state across a set of clients. We need to decide how to represent our state, as well as the updates. The simplest plausible format is a key-value store, where one key-value pair represents an atomic unit of change in the shared state.</p><p>We have a simple pub-sub example in ØMQ基础<a class="xref" href="ch01.html" title="Chapter 1. ØMQ基础">Chapter 1, <em>ØMQ基础</em></a>, the weather server and client. Let's change the server to send key-value pairs, and the client to store these in a hash table. This lets us send updates from one server to a set of clients using the classic pub-sub model<a class="xref" href="ch05s06.html#figure-58" title="Figure 5.3. Publishing State Updates">Figure 5.3, “Publishing State Updates”</a>.</p><p>An update is either a new key-value pair, a modified value for an existing key, or a deleted key. We can assume for now that the whole store fits in memory and that applications access it by key, such as by using a hash table or dictionary. For larger stores and some kind of persistence we'd probably store the state in a database, but that's not relevant here.</p><p>This is the server:</p><div class="example"><a id="clonesrv1-c"></a><p class="title"><strong>Example 5.13. Clone server, Model One (clonesrv1.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Clone server Model One
+
+#include "kvsimple.c"
+
+int main (void)
+{
+    //  Prepare our context and publisher socket
+    zctx_t *ctx = zctx_new ();
+    void *publisher = zsocket_new (ctx, ZMQ_PUB);
+    zsocket_bind (publisher, "tcp://*:5556");
+    zclock_sleep (200);
+
+    zhash_t *kvmap = zhash_new ();
+    int64_t sequence = 0;
+    srandom ((unsigned) time (NULL));
+
+    while (!zctx_interrupted) {
+        //  Distribute as key-value message
+        kvmsg_t *kvmsg = kvmsg_new (++sequence);
+        kvmsg_fmt_key  (kvmsg, "%d", randof (10000));
+        kvmsg_fmt_body (kvmsg, "%d", randof (1000000));
+        kvmsg_send     (kvmsg, publisher);
+        kvmsg_store   (&amp;kvmsg, kvmap);
+    }
+    printf (" Interrupted\n%d messages out\n", (int) sequence);
+    zhash_destroy (&amp;kvmap);
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>And here is the client:</p><div class="example"><a id="clonecli1-c"></a><p class="title"><strong>Example 5.14. Clone client, Model One (clonecli1.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Clone client Model One
+
+#include "kvsimple.c"
+
+int main (void)
+{
+    //  Prepare our context and updates socket
+    zctx_t *ctx = zctx_new ();
+    void *updates = zsocket_new (ctx, ZMQ_SUB);
+    zsocket_set_subscribe (updates, "");
+    zsocket_connect (updates, "tcp://localhost:5556");
+
+    zhash_t *kvmap = zhash_new ();
+    int64_t sequence = 0;
+
+    while (true) {
+        kvmsg_t *kvmsg = kvmsg_recv (updates);
+        if (!kvmsg)
+            break;          //  Interrupted
+        kvmsg_store (&amp;kvmsg, kvmap);
+        sequence++;
+    }
+    printf (" Interrupted\n%d messages in\n", (int) sequence);
+    zhash_destroy (&amp;kvmap);
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><div class="figure"><a id="figure-58"></a><p class="title"><strong>Figure 5.3. Publishing State Updates</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig58.png" alt="Publishing State Updates" /></div></div></div><br class="figure-break" /><p>Here are some things to note about this first model:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>All the hard work is done in a <code class="literal">kvmsg</code> class. This class works with key-value message objects, which are multipart ØMQ messages structured as three frames: a key (a ØMQ string), a sequence number (64-bit value, in network byte order), and a binary body (holds everything else).</p></li><li class="listitem"><p>The server generates messages with a randomized 4-digit key, which lets us simulate a large but not enormous hash table (10K entries).</p></li><li class="listitem"><p>We don't implement deletions in this version: all messages are inserts or updates.</p></li><li class="listitem"><p>The server does a 200 millisecond pause after binding its socket. This is to prevent <span class="emphasis"><em>slow joiner syndrome</em></span>, where the subscriber loses messages as it connects to the server's socket. We'll remove that in later versions of the Clone code.</p></li><li class="listitem"><p>We'll use the terms <span class="emphasis"><em>publisher</em></span> and <span class="emphasis"><em>subscriber</em></span> in the code to refer to sockets. This will help later when we have multiple sockets doing different things.</p></li></ul></div><p>Here is the <code class="literal">kvmsg</code> class, in the simplest form that works for now:</p><div class="example"><a id="kvsimple-c"></a><p class="title"><strong>Example 5.15. Key-value message class (kvsimple.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  kvsimple class - key-value message class for example applications
+
+#include "kvsimple.h"
+#include "zlist.h"
+
+//  Keys are short strings
+#define KVMSG_KEY_MAX   255
+
+//  Message is formatted on wire as 4 frames:
+//  frame 0: key (0MQ string)
+//  frame 1: sequence (8 bytes, network order)
+//  frame 2: body (blob)
+#define FRAME_KEY       0
+#define FRAME_SEQ       1
+#define FRAME_BODY      2
+#define KVMSG_FRAMES    3
+
+//  The kvmsg class holds a single key-value message consisting of a
+//  list of 0 or more frames:
+
+struct _kvmsg {
+    //  Presence indicators for each frame
+    int present [KVMSG_FRAMES];
+    //  Corresponding 0MQ message frames, if any
+    zmq_msg_t frame [KVMSG_FRAMES];
+    //  Key, copied into safe C string
+    char key [KVMSG_KEY_MAX + 1];
+};
+</pre></div></div><br class="example-break" /><p>Here are the constructor and destructor for the class: 
+</p><div class="example"><a id="kvsimple-c-1"></a><p class="title"><strong>Example 5.16. Key-value message class (kvsimple.c) - constructor and destructor</strong></p><div class="example-contents"><pre class="programlisting">
+
+//  Constructor, takes a sequence number for the new kvmsg instance:
+kvmsg_t *
+kvmsg_new (int64_t sequence)
+{
+    kvmsg_t
+        *self;
+
+    self = (kvmsg_t *) zmalloc (sizeof (kvmsg_t));
+    kvmsg_set_sequence (self, sequence);
+    return self;
+}
+
+//  zhash_free_fn callback helper that does the low level destruction:
+void
+kvmsg_free (void *ptr)
+{
+    if (ptr) {
+        kvmsg_t *self = (kvmsg_t *) ptr;
+        //  Destroy message frames if any
+        int frame_nbr;
+        for (frame_nbr = 0; frame_nbr &lt; KVMSG_FRAMES; frame_nbr++)
+            if (self-&gt;present [frame_nbr])
+                zmq_msg_close (&amp;self-&gt;frame [frame_nbr]);
+
+        //  Free object itself
+        free (self);
+    }
+}
+
+//  Destructor
+void
+kvmsg_destroy (kvmsg_t **self_p)
+{
+    assert (self_p);
+    if (*self_p) {
+        kvmsg_free (*self_p);
+        *self_p = NULL;
+    }
+}
+</pre></div></div><br class="example-break" /><p>This method reads a key-value message from socket, and returns a new <code class="literal">kvmsg</code> instance: 
+</p><div class="example"><a id="kvsimple-c-2"></a><p class="title"><strong>Example 5.17. Key-value message class (kvsimple.c) - recv method</strong></p><div class="example-contents"><pre class="programlisting">
+
+kvmsg_t *
+kvmsg_recv (void *socket)
+{
+    assert (socket);
+    kvmsg_t *self = kvmsg_new (0);
+
+    //  Read all frames off the wire, reject if bogus
+    int frame_nbr;
+    for (frame_nbr = 0; frame_nbr &lt; KVMSG_FRAMES; frame_nbr++) {
+        if (self-&gt;present [frame_nbr])
+            zmq_msg_close (&amp;self-&gt;frame [frame_nbr]);
+        zmq_msg_init (&amp;self-&gt;frame [frame_nbr]);
+        self-&gt;present [frame_nbr] = 1;
+        if (zmq_msg_recv (&amp;self-&gt;frame [frame_nbr], socket, 0) == -1) {
+            kvmsg_destroy (&amp;self);
+            break;
+        }
+        //  Verify multipart framing
+        int rcvmore = (frame_nbr &lt; KVMSG_FRAMES - 1)? 1: 0;
+        if (zsocket_rcvmore (socket) != rcvmore) {
+            kvmsg_destroy (&amp;self);
+            break;
+        }
+    }
+    return self;
+}
+</pre></div></div><br class="example-break" /><p>This method sends a multiframe key-value message to a socket: 
+</p><div class="example"><a id="kvsimple-c-3"></a><p class="title"><strong>Example 5.18. Key-value message class (kvsimple.c) - send method</strong></p><div class="example-contents"><pre class="programlisting">
+
+void
+kvmsg_send (kvmsg_t *self, void *socket)
+{
+    assert (self);
+    assert (socket);
+
+    int frame_nbr;
+    for (frame_nbr = 0; frame_nbr &lt; KVMSG_FRAMES; frame_nbr++) {
+        zmq_msg_t copy;
+        zmq_msg_init (&amp;copy);
+        if (self-&gt;present [frame_nbr])
+            zmq_msg_copy (&amp;copy, &amp;self-&gt;frame [frame_nbr]);
+        zmq_msg_send (&amp;copy, socket, 
+            (frame_nbr &lt; KVMSG_FRAMES - 1)? ZMQ_SNDMORE: 0);
+        zmq_msg_close (&amp;copy);
+    }
+}
+</pre></div></div><br class="example-break" /><p>These methods let the caller get and set the message key, as a fixed string and as a printf formatted string: 
+</p><div class="example"><a id="kvsimple-c-4"></a><p class="title"><strong>Example 5.19. Key-value message class (kvsimple.c) - key methods</strong></p><div class="example-contents"><pre class="programlisting">
+
+char *
+kvmsg_key (kvmsg_t *self)
+{
+    assert (self);
+    if (self-&gt;present [FRAME_KEY]) {
+        if (!*self-&gt;key) {
+            size_t size = zmq_msg_size (&amp;self-&gt;frame [FRAME_KEY]);
+            if (size &gt; KVMSG_KEY_MAX)
+                size = KVMSG_KEY_MAX;
+            memcpy (self-&gt;key,
+                zmq_msg_data (&amp;self-&gt;frame [FRAME_KEY]), size);
+            self-&gt;key [size] = 0;
+        }
+        return self-&gt;key;
+    }
+    else
+        return NULL;
+}
+
+void
+kvmsg_set_key (kvmsg_t *self, char *key)
+{
+    assert (self);
+    zmq_msg_t *msg = &amp;self-&gt;frame [FRAME_KEY];
+    if (self-&gt;present [FRAME_KEY])
+        zmq_msg_close (msg);
+    zmq_msg_init_size (msg, strlen (key));
+    memcpy (zmq_msg_data (msg), key, strlen (key));
+    self-&gt;present [FRAME_KEY] = 1;
+}
+
+void
+kvmsg_fmt_key (kvmsg_t *self, char *format, ...)
+{
+    char value [KVMSG_KEY_MAX + 1];
+    va_list args;
+
+    assert (self);
+    va_start (args, format);
+    vsnprintf (value, KVMSG_KEY_MAX, format, args);
+    va_end (args);
+    kvmsg_set_key (self, value);
+}
+</pre></div></div><br class="example-break" /><p>These two methods let the caller get and set the message sequence number: 
+</p><div class="example"><a id="kvsimple-c-5"></a><p class="title"><strong>Example 5.20. Key-value message class (kvsimple.c) - sequence methods</strong></p><div class="example-contents"><pre class="programlisting">
+
+int64_t
+kvmsg_sequence (kvmsg_t *self)
+{
+    assert (self);
+    if (self-&gt;present [FRAME_SEQ]) {
+        assert (zmq_msg_size (&amp;self-&gt;frame [FRAME_SEQ]) == 8);
+        byte *source = zmq_msg_data (&amp;self-&gt;frame [FRAME_SEQ]);
+        int64_t sequence = ((int64_t) (source [0]) &lt;&lt; 56)
+                         + ((int64_t) (source [1]) &lt;&lt; 48)
+                         + ((int64_t) (source [2]) &lt;&lt; 40)
+                         + ((int64_t) (source [3]) &lt;&lt; 32)
+                         + ((int64_t) (source [4]) &lt;&lt; 24)
+                         + ((int64_t) (source [5]) &lt;&lt; 16)
+                         + ((int64_t) (source [6]) &lt;&lt; 8)
+                         +  (int64_t) (source [7]);
+        return sequence;
+    }
+    else
+        return 0;
+}
+
+void
+kvmsg_set_sequence (kvmsg_t *self, int64_t sequence)
+{
+    assert (self);
+    zmq_msg_t *msg = &amp;self-&gt;frame [FRAME_SEQ];
+    if (self-&gt;present [FRAME_SEQ])
+        zmq_msg_close (msg);
+    zmq_msg_init_size (msg, 8);
+
+    byte *source = zmq_msg_data (msg);
+    source [0] = (byte) ((sequence &gt;&gt; 56) &amp; 255);
+    source [1] = (byte) ((sequence &gt;&gt; 48) &amp; 255);
+    source [2] = (byte) ((sequence &gt;&gt; 40) &amp; 255);
+    source [3] = (byte) ((sequence &gt;&gt; 32) &amp; 255);
+    source [4] = (byte) ((sequence &gt;&gt; 24) &amp; 255);
+    source [5] = (byte) ((sequence &gt;&gt; 16) &amp; 255);
+    source [6] = (byte) ((sequence &gt;&gt; 8)  &amp; 255);
+    source [7] = (byte) ((sequence)       &amp; 255);
+
+    self-&gt;present [FRAME_SEQ] = 1;
+}
+</pre></div></div><br class="example-break" /><p>These methods let the caller get and set the message body as a fixed string and as a printf formatted string: 
+</p><div class="example"><a id="kvsimple-c-6"></a><p class="title"><strong>Example 5.21. Key-value message class (kvsimple.c) - message body methods</strong></p><div class="example-contents"><pre class="programlisting">
+
+byte *
+kvmsg_body (kvmsg_t *self)
+{
+    assert (self);
+    if (self-&gt;present [FRAME_BODY])
+        return (byte *) zmq_msg_data (&amp;self-&gt;frame [FRAME_BODY]);
+    else
+        return NULL;
+}
+
+void
+kvmsg_set_body (kvmsg_t *self, byte *body, size_t size)
+{
+    assert (self);
+    zmq_msg_t *msg = &amp;self-&gt;frame [FRAME_BODY];
+    if (self-&gt;present [FRAME_BODY])
+        zmq_msg_close (msg);
+    self-&gt;present [FRAME_BODY] = 1;
+    zmq_msg_init_size (msg, size);
+    memcpy (zmq_msg_data (msg), body, size);
+}
+
+void
+kvmsg_fmt_body (kvmsg_t *self, char *format, ...)
+{
+    char value [255 + 1];
+    va_list args;
+
+    assert (self);
+    va_start (args, format);
+    vsnprintf (value, 255, format, args);
+    va_end (args);
+    kvmsg_set_body (self, (byte *) value, strlen (value));
+}
+</pre></div></div><br class="example-break" /><p>This method returns the body size of the most recently read message, if any exists: 
+</p><div class="example"><a id="kvsimple-c-7"></a><p class="title"><strong>Example 5.22. Key-value message class (kvsimple.c) - size method</strong></p><div class="example-contents"><pre class="programlisting">
+
+size_t
+kvmsg_size (kvmsg_t *self)
+{
+    assert (self);
+    if (self-&gt;present [FRAME_BODY])
+        return zmq_msg_size (&amp;self-&gt;frame [FRAME_BODY]);
+    else
+        return 0;
+}
+</pre></div></div><br class="example-break" /><p>This method stores the key-value message into a hash map, unless the key and value are both null. It nullifies the <code class="literal">kvmsg</code> reference so that the object is owned by the hash map, not the caller: 
+</p><div class="example"><a id="kvsimple-c-8"></a><p class="title"><strong>Example 5.23. Key-value message class (kvsimple.c) - store method</strong></p><div class="example-contents"><pre class="programlisting">
+
+void
+kvmsg_store (kvmsg_t **self_p, zhash_t *hash)
+{
+    assert (self_p);
+    if (*self_p) {
+        kvmsg_t *self = *self_p;
+        assert (self);
+        if (self-&gt;present [FRAME_KEY]
+        &amp;&amp;  self-&gt;present [FRAME_BODY]) {
+            zhash_update (hash, kvmsg_key (self), self);
+            zhash_freefn (hash, kvmsg_key (self), kvmsg_free);
+        }
+        *self_p = NULL;
+    }
+}
+</pre></div></div><br class="example-break" /><p>This method prints the key-value message to stderr for debugging and tracing: 
+</p><div class="example"><a id="kvsimple-c-9"></a><p class="title"><strong>Example 5.24. Key-value message class (kvsimple.c) - dump method</strong></p><div class="example-contents"><pre class="programlisting">
+
+void
+kvmsg_dump (kvmsg_t *self)
+{
+    if (self) {
+        if (!self) {
+            fprintf (stderr, "NULL");
+            return;
+        }
+        size_t size = kvmsg_size (self);
+        byte  *body = kvmsg_body (self);
+        fprintf (stderr, "[seq:%" PRId64 "]", kvmsg_sequence (self));
+        fprintf (stderr, "[key:%s]", kvmsg_key (self));
+        fprintf (stderr, "[size:%zd] ", size);
+        int char_nbr;
+        for (char_nbr = 0; char_nbr &lt; size; char_nbr++)
+            fprintf (stderr, "%02X", body [char_nbr]);
+        fprintf (stderr, "\n");
+    }
+    else
+        fprintf (stderr, "NULL message\n");
+}
+</pre></div></div><br class="example-break" /><p>It's good practice to have a self-test method that tests the class; this also shows how it's used in applications: 
+</p><div class="example"><a id="kvsimple-c-10"></a><p class="title"><strong>Example 5.25. Key-value message class (kvsimple.c) - test method</strong></p><div class="example-contents"><pre class="programlisting">
+
+int
+kvmsg_test (int verbose)
+{
+    kvmsg_t
+        *kvmsg;
+
+    printf (" * kvmsg: ");
+
+    //  Prepare our context and sockets
+    zctx_t *ctx = zctx_new ();
+    void *output = zsocket_new (ctx, ZMQ_DEALER);
+    int rc = zmq_bind (output, "ipc://kvmsg_selftest.ipc");
+    assert (rc == 0);
+    void *input = zsocket_new (ctx, ZMQ_DEALER);
+    rc = zmq_connect (input, "ipc://kvmsg_selftest.ipc");
+    assert (rc == 0);
+
+    zhash_t *kvmap = zhash_new ();
+
+    //  Test send and receive of simple message
+    kvmsg = kvmsg_new (1);
+    kvmsg_set_key  (kvmsg, "key");
+    kvmsg_set_body (kvmsg, (byte *) "body", 4);
+    if (verbose)
+        kvmsg_dump (kvmsg);
+    kvmsg_send (kvmsg, output);
+    kvmsg_store (&amp;kvmsg, kvmap);
+
+    kvmsg = kvmsg_recv (input);
+    if (verbose)
+        kvmsg_dump (kvmsg);
+    assert (streq (kvmsg_key (kvmsg), "key"));
+    kvmsg_store (&amp;kvmsg, kvmap);
+
+    //  Shutdown and destroy all objects
+    zhash_destroy (&amp;kvmap);
+    zctx_destroy (&amp;ctx);
+
+    printf ("OK\n");
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>Later, we'll make a more sophisticated <code class="literal">kvmsg</code> class that will work in in real applications.</p><p>Both the server and client maintain hash tables, but this first model only works properly if we start all clients before the server and the clients never crash. That's very artificial.</p></div><div class="sect2" title="Getting an Out-of-Band Snapshot"><div class="titlepage"><div><div><h3 class="title"><a id="idp20290080"></a>Getting an Out-of-Band Snapshot</h3></div></div></div><p>So now we have our second problem: how to deal with late-joining clients or clients that crash and then restart.</p><p>In order to allow a late (or recovering) client to catch up with a server, it has to get a snapshot of the server's state. Just as we've reduced "message" to mean "a sequenced key-value pair", we can reduce "state" to mean "a hash table". To get the server state, a client opens a DEALER socket and asks for it explicitly<a class="xref" href="ch05s06.html#figure-59" title="Figure 5.4. State Replication">Figure 5.4, “State Replication”</a>.</p><p>To make this work, we have to solve a problem of timing. Getting a state snapshot will take a certain time, possibly fairly long if the snapshot is large. We need to correctly apply updates to the snapshot. But the server won't know when to start sending us updates. One way would be to start subscribing, get a first update, and then ask for "state for update N". This would require the server storing one snapshot for each update, which isn't practical.</p><div class="figure"><a id="figure-59"></a><p class="title"><strong>Figure 5.4. State Replication</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig59.png" alt="State Replication" /></div></div></div><br class="figure-break" /><p>So we will do the synchronization in the client, as follows:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The client first subscribes to updates and then makes a state request. This guarantees that the state is going to be newer than the oldest update it has.</p></li><li class="listitem"><p>The client waits for the server to reply with state, and meanwhile queues all updates. It does this simply by not reading them: ØMQ keeps them queued on the socket queue.</p></li><li class="listitem"><p>When the client receives its state update, it begins once again to read updates. However, it discards any updates that are older than the state update. So if the state update includes updates up to 200, the client will discard updates up to 201.</p></li><li class="listitem"><p>The client then applies updates to its own state snapshot.</p></li></ul></div><p>It's a simple model that exploits ØMQ's own internal queues. Here's the server:</p><div class="example"><a id="clonesrv2-c"></a><p class="title"><strong>Example 5.26. Clone server, Model Two (clonesrv2.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Clone server - Model Two
+
+//  Lets us build this source without creating a library
+#include "kvsimple.c"
+
+static int s_send_single (const char *key, void *data, void *args);
+static void state_manager (void *args, zctx_t *ctx, void *pipe);
+
+int main (void)
+{
+    //  Prepare our context and sockets
+    zctx_t *ctx = zctx_new ();
+    void *publisher = zsocket_new (ctx, ZMQ_PUB);
+    zsocket_bind (publisher, "tcp://*:5557");
+
+    int64_t sequence = 0;
+    srandom ((unsigned) time (NULL));
+
+    //  Start state manager and wait for synchronization signal
+    void *updates = zthread_fork (ctx, state_manager, NULL);
+    free (zstr_recv (updates));
+
+    while (!zctx_interrupted) {
+        //  Distribute as key-value message
+        kvmsg_t *kvmsg = kvmsg_new (++sequence);
+        kvmsg_fmt_key  (kvmsg, "%d", randof (10000));
+        kvmsg_fmt_body (kvmsg, "%d", randof (1000000));
+        kvmsg_send     (kvmsg, publisher);
+        kvmsg_send     (kvmsg, updates);
+        kvmsg_destroy (&amp;kvmsg);
+    }
+    printf (" Interrupted\n%d messages out\n", (int) sequence);
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+
+//  Routing information for a key-value snapshot
+typedef struct {
+    void *socket;           //  ROUTER socket to send to
+    zframe_t *identity;     //  Identity of peer who requested state
+} kvroute_t;
+
+//  Send one state snapshot key-value pair to a socket
+//  Hash item data is our kvmsg object, ready to send
+static int
+s_send_single (const char *key, void *data, void *args)
+{
+    kvroute_t *kvroute = (kvroute_t *) args;
+    //  Send identity of recipient first
+    zframe_send (&amp;kvroute-&gt;identity,
+        kvroute-&gt;socket, ZFRAME_MORE + ZFRAME_REUSE);
+    kvmsg_t *kvmsg = (kvmsg_t *) data;
+    kvmsg_send (kvmsg, kvroute-&gt;socket);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>The state manager task maintains the state and handles requests from clients for snapshots: 
+</p><div class="example"><a id="clonesrv2-c-1"></a><p class="title"><strong>Example 5.27. Clone server, Model Two (clonesrv2.c) - state manager</strong></p><div class="example-contents"><pre class="programlisting">
+
+static void
+state_manager (void *args, zctx_t *ctx, void *pipe)
+{
+    zhash_t *kvmap = zhash_new ();
+
+    zstr_send (pipe, "READY");
+    void *snapshot = zsocket_new (ctx, ZMQ_ROUTER);
+    zsocket_bind (snapshot, "tcp://*:5556");
+
+    zmq_pollitem_t items [] = {
+        { pipe, 0, ZMQ_POLLIN, 0 },
+        { snapshot, 0, ZMQ_POLLIN, 0 }
+    };
+    int64_t sequence = 0;       //  Current snapshot version number
+    while (!zctx_interrupted) {
+        int rc = zmq_poll (items, 2, -1);
+        if (rc == -1 &amp;&amp; errno == ETERM)
+            break;              //  Context has been shut down
+
+        //  Apply state update from main thread
+        if (items [0].revents &amp; ZMQ_POLLIN) {
+            kvmsg_t *kvmsg = kvmsg_recv (pipe);
+            if (!kvmsg)
+                break;          //  Interrupted
+            sequence = kvmsg_sequence (kvmsg);
+            kvmsg_store (&amp;kvmsg, kvmap);
+        }
+        //  Execute state snapshot request
+        if (items [1].revents &amp; ZMQ_POLLIN) {
+            zframe_t *identity = zframe_recv (snapshot);
+            if (!identity)
+                break;          //  Interrupted
+
+            //  Request is in second frame of message
+            char *request = zstr_recv (snapshot);
+            if (streq (request, "ICANHAZ?"))
+                free (request);
+            else {
+                printf ("E: bad request, aborting\n");
+                break;
+            }
+            //  Send state snapshot to client
+            kvroute_t routing = { snapshot, identity };
+
+            //  For each entry in kvmap, send kvmsg to client
+            zhash_foreach (kvmap, s_send_single, &amp;routing);
+
+            //  Now send END message with sequence number
+            printf ("Sending state shapshot=%d\n", (int) sequence);
+            zframe_send (&amp;identity, snapshot, ZFRAME_MORE);
+            kvmsg_t *kvmsg = kvmsg_new (sequence);
+            kvmsg_set_key  (kvmsg, "KTHXBAI");
+            kvmsg_set_body (kvmsg, (byte *) "", 0);
+            kvmsg_send     (kvmsg, snapshot);
+            kvmsg_destroy (&amp;kvmsg);
+        }
+    }
+    zhash_destroy (&amp;kvmap);
+}
+</pre></div></div><br class="example-break" /><p>And here is the client:</p><div class="example"><a id="clonecli2-c"></a><p class="title"><strong>Example 5.28. Clone client, Model Two (clonecli2.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Clone client - Model Two
+
+//  Lets us build this source without creating a library
+#include "kvsimple.c"
+
+int main (void)
+{
+    //  Prepare our context and subscriber
+    zctx_t *ctx = zctx_new ();
+    void *snapshot = zsocket_new (ctx, ZMQ_DEALER);
+    zsocket_connect (snapshot, "tcp://localhost:5556");
+    void *subscriber = zsocket_new (ctx, ZMQ_SUB);
+    zsocket_set_subscribe (subscriber, "");
+    zsocket_connect (subscriber, "tcp://localhost:5557");
+
+    zhash_t *kvmap = zhash_new ();
+
+    //  Get state snapshot
+    int64_t sequence = 0;
+    zstr_send (snapshot, "ICANHAZ?");
+    while (true) {
+        kvmsg_t *kvmsg = kvmsg_recv (snapshot);
+        if (!kvmsg)
+            break;          //  Interrupted
+        if (streq (kvmsg_key (kvmsg), "KTHXBAI")) {
+            sequence = kvmsg_sequence (kvmsg);
+            printf ("Received snapshot=%d\n", (int) sequence);
+            kvmsg_destroy (&amp;kvmsg);
+            break;          //  Done
+        }
+        kvmsg_store (&amp;kvmsg, kvmap);
+    }
+    //  Now apply pending updates, discard out-of-sequence messages
+    while (!zctx_interrupted) {
+        kvmsg_t *kvmsg = kvmsg_recv (subscriber);
+        if (!kvmsg)
+            break;          //  Interrupted
+        if (kvmsg_sequence (kvmsg) &gt; sequence) {
+            sequence = kvmsg_sequence (kvmsg);
+            kvmsg_store (&amp;kvmsg, kvmap);
+        }
+        else
+            kvmsg_destroy (&amp;kvmsg);
+    }
+    zhash_destroy (&amp;kvmap);
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>Here are some things to note about these two programs:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The server uses two tasks. One thread produces the updates (randomly) and sends these to the main PUB socket, while the other thread handles state requests on the ROUTER socket. The two communicate across PAIR sockets over an <code class="literal">inproc://</code> connection.</p></li><li class="listitem"><p>The client is really simple. In C, it consists of about fifty lines of code. A lot of the heavy lifting is done in the <code class="literal">kvmsg</code> class. Even so, the basic Clone pattern is easier to implement than it seemed at first.</p></li><li class="listitem"><p>We don't use anything fancy for serializing the state. The hash table holds a set of <code class="literal">kvmsg</code> objects, and the server sends these, as a batch of messages, to the client requesting state. If multiple clients request state at once, each will get a different snapshot.</p></li><li class="listitem"><p>We assume that the client has exactly one server to talk to. The server must be running; we do not try to solve the question of what happens if the server crashes.</p></li></ul></div><p>Right now, these two programs don't do anything real, but they correctly synchronize state. It's a neat example of how to mix different patterns: PAIR-PAIR, PUB-SUB, and ROUTER-DEALER.</p></div><div class="sect2" title="Republishing Updates from Clients"><div class="titlepage"><div><div><h3 class="title"><a id="idp20310304"></a>Republishing Updates from Clients</h3></div></div></div><p>In our second model, changes to the key-value store came from the server itself. This is a centralized model that is useful, for example if we have a central configuration file we want to distribute, with local caching on each node. A more interesting model takes updates from clients, not the server. The server thus becomes a stateless broker. This gives us some benefits:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>We're less worried about the reliability of the server. If it crashes, we can start a new instance and feed it new values.</p></li><li class="listitem"><p>We can use the key-value store to share knowledge between active peers.</p></li></ul></div><p>To send updates from clients back to the server, we could use a variety of socket patterns. The simplest plausible solution is a PUSH-PULL combination<a class="xref" href="ch05s06.html#figure-60" title="Figure 5.5. Republishing Updates">Figure 5.5, “Republishing Updates”</a>.</p><p>Why don't we allow clients to publish updates directly to each other? While this would reduce latency, it would remove the guarantee of consistency. You can't get consistent shared state if you allow the order of updates to change depending on who receives them. Say we have two clients, changing different keys. This will work fine. But if the two clients try to change the same key at roughly the same time, they'll end up with different notions of its value.</p><p>There are a few strategies for obtaining consistency when changes happen in multiple places at once. We'll use the approach of centralizing all change. No matter the precise timing of the changes that clients make, they are all pushed through the server, which enforces a single sequence according to the order in which it gets updates.</p><div class="figure"><a id="figure-60"></a><p class="title"><strong>Figure 5.5. Republishing Updates</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig60.png" alt="Republishing Updates" /></div></div></div><br class="figure-break" /><p>By mediating all changes, the server can also add a unique sequence number to all updates. With unique sequencing, clients can detect the nastier failures, including network congestion and queue overflow. If a client discovers that its incoming message stream has a hole, it can take action. It seems sensible that the client contact the server and ask for the missing messages, but in practice that isn't useful. If there are holes, they're caused by network stress, and adding more stress to the network will make things worse. All the client can do is warn its users that it is "unable to continue", stop, and not restart until someone has manually checked the cause of the problem.</p><p>We'll now generate state updates in the client. Here's the server:</p><div class="example"><a id="clonesrv3-c"></a><p class="title"><strong>Example 5.29. Clone server, Model Three (clonesrv3.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Clone server - Model Three
+
+//  Lets us build this source without creating a library
+#include "kvsimple.c"
+
+//  Routing information for a key-value snapshot
+typedef struct {
+    void *socket;           //  ROUTER socket to send to
+    zframe_t *identity;     //  Identity of peer who requested state
+} kvroute_t;
+
+//  Send one state snapshot key-value pair to a socket
+//  Hash item data is our kvmsg object, ready to send
+static int
+s_send_single (const char *key, void *data, void *args)
+{
+    kvroute_t *kvroute = (kvroute_t *) args;
+    //  Send identity of recipient first
+    zframe_send (&amp;kvroute-&gt;identity,
+        kvroute-&gt;socket, ZFRAME_MORE + ZFRAME_REUSE);
+    kvmsg_t *kvmsg = (kvmsg_t *) data;
+    kvmsg_send (kvmsg, kvroute-&gt;socket);
+    return 0;
+}
+
+int main (void)
+{
+    //  Prepare our context and sockets
+    zctx_t *ctx = zctx_new ();
+    void *snapshot = zsocket_new (ctx, ZMQ_ROUTER);
+    zsocket_bind (snapshot, "tcp://*:5556");
+    void *publisher = zsocket_new (ctx, ZMQ_PUB);
+    zsocket_bind (publisher, "tcp://*:5557");
+    void *collector = zsocket_new (ctx, ZMQ_PULL);
+    zsocket_bind (collector, "tcp://*:5558");
+</pre></div></div><br class="example-break" /><p>The body of the main task collects updates from clients and publishes them back out to clients: 
+</p><div class="example"><a id="clonesrv3-c-1"></a><p class="title"><strong>Example 5.30. Clone server, Model Three (clonesrv3.c) - body of main task</strong></p><div class="example-contents"><pre class="programlisting">
+
+    int64_t sequence = 0;
+    zhash_t *kvmap = zhash_new ();
+
+    zmq_pollitem_t items [] = {
+        { collector, 0, ZMQ_POLLIN, 0 },
+        { snapshot, 0, ZMQ_POLLIN, 0 }
+    };
+    while (!zctx_interrupted) {
+        int rc = zmq_poll (items, 2, 1000 * ZMQ_POLL_MSEC);
+
+        //  Apply state update sent from client
+        if (items [0].revents &amp; ZMQ_POLLIN) {
+            kvmsg_t *kvmsg = kvmsg_recv (collector);
+            if (!kvmsg)
+                break;          //  Interrupted
+            kvmsg_set_sequence (kvmsg, ++sequence);
+            kvmsg_send (kvmsg, publisher);
+            kvmsg_store (&amp;kvmsg, kvmap);
+            printf ("I: publishing update %5d\n", (int) sequence);
+        }
+        //  Execute state snapshot request
+        if (items [1].revents &amp; ZMQ_POLLIN) {
+            zframe_t *identity = zframe_recv (snapshot);
+            if (!identity)
+                break;          //  Interrupted
+
+            //  Request is in second frame of message
+            char *request = zstr_recv (snapshot);
+            if (streq (request, "ICANHAZ?"))
+                free (request);
+            else {
+                printf ("E: bad request, aborting\n");
+                break;
+            }
+            //  Send state snapshot to client
+            kvroute_t routing = { snapshot, identity };
+
+            //  For each entry in kvmap, send kvmsg to client
+            zhash_foreach (kvmap, s_send_single, &amp;routing);
+
+            //  Now send END message with sequence number
+            printf ("I: sending shapshot=%d\n", (int) sequence);
+            zframe_send (&amp;identity, snapshot, ZFRAME_MORE);
+            kvmsg_t *kvmsg = kvmsg_new (sequence);
+            kvmsg_set_key  (kvmsg, "KTHXBAI");
+            kvmsg_set_body (kvmsg, (byte *) "", 0);
+            kvmsg_send     (kvmsg, snapshot);
+            kvmsg_destroy (&amp;kvmsg);
+        }
+    }
+    printf (" Interrupted\n%d messages handled\n", (int) sequence);
+    zhash_destroy (&amp;kvmap);
+    zctx_destroy (&amp;ctx);
+
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>And here is the client:</p><div class="example"><a id="clonecli3-c"></a><p class="title"><strong>Example 5.31. Clone client, Model Three (clonecli3.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Clone client - Model Three
+
+//  Lets us build this source without creating a library
+#include "kvsimple.c"
+
+int main (void)
+{
+    //  Prepare our context and subscriber
+    zctx_t *ctx = zctx_new ();
+    void *snapshot = zsocket_new (ctx, ZMQ_DEALER);
+    zsocket_connect (snapshot, "tcp://localhost:5556");
+    void *subscriber = zsocket_new (ctx, ZMQ_SUB);
+    zsocket_set_subscribe (subscriber, "");
+    zsocket_connect (subscriber, "tcp://localhost:5557");
+    void *publisher = zsocket_new (ctx, ZMQ_PUSH);
+    zsocket_connect (publisher, "tcp://localhost:5558");
+
+    zhash_t *kvmap = zhash_new ();
+    srandom ((unsigned) time (NULL));
+</pre></div></div><br class="example-break" /><p>We first request a state snapshot: 
+</p><div class="example"><a id="clonecli3-c-1"></a><p class="title"><strong>Example 5.32. Clone client, Model Three (clonecli3.c) - getting a state snapshot</strong></p><div class="example-contents"><pre class="programlisting">
+
+    zstr_send (snapshot, "ICANHAZ?");
+    while (true) {
+        kvmsg_t *kvmsg = kvmsg_recv (snapshot);
+        if (!kvmsg)
+            break;          //  Interrupted
+        if (streq (kvmsg_key (kvmsg), "KTHXBAI")) {
+            sequence = kvmsg_sequence (kvmsg);
+            printf ("I: received snapshot=%d\n", (int) sequence);
+            kvmsg_destroy (&amp;kvmsg);
+            break;          //  Done
+        }
+        kvmsg_store (&amp;kvmsg, kvmap);
+    }
+</pre></div></div><br class="example-break" /><p>Now we wait for updates from the server and every so often, we send a random key-value update to the server: 
+</p><div class="example"><a id="clonecli3-c-2"></a><p class="title"><strong>Example 5.33. Clone client, Model Three (clonecli3.c) - processing state updates</strong></p><div class="example-contents"><pre class="programlisting">
+    int64_t alarm = zclock_time () + 1000;
+    while (!zctx_interrupted) {
+        zmq_pollitem_t items [] = { { subscriber, 0, ZMQ_POLLIN, 0 } };
+        int tickless = (int) ((alarm - zclock_time ()));
+        if (tickless &lt; 0)
+            tickless = 0;
+        int rc = zmq_poll (items, 1, tickless * ZMQ_POLL_MSEC);
+        if (rc == -1)
+            break;              //  Context has been shut down
+
+        if (items [0].revents &amp; ZMQ_POLLIN) {
+            kvmsg_t *kvmsg = kvmsg_recv (subscriber);
+            if (!kvmsg)
+                break;          //  Interrupted
+
+            //  Discard out-of-sequence kvmsgs, incl. heartbeats
+            if (kvmsg_sequence (kvmsg) &gt; sequence) {
+                sequence = kvmsg_sequence (kvmsg);
+                kvmsg_store (&amp;kvmsg, kvmap);
+                printf ("I: received update=%d\n", (int) sequence);
+            }
+            else
+                kvmsg_destroy (&amp;kvmsg);
+        }
+        //  If we timed out, generate a random kvmsg
+        if (zclock_time () &gt;= alarm) {
+            kvmsg_t *kvmsg = kvmsg_new (0);
+            kvmsg_fmt_key  (kvmsg, "%d", randof (10000));
+            kvmsg_fmt_body (kvmsg, "%d", randof (1000000));
+            kvmsg_send     (kvmsg, publisher);
+            kvmsg_destroy (&amp;kvmsg);
+            alarm = zclock_time () + 1000;
+        }
+    }
+    printf (" Interrupted\n%d messages in\n", (int) sequence);
+    zhash_destroy (&amp;kvmap);
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>Here are some things to note about this third design:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The server has collapsed to a single task. It manages a PULL socket for incoming updates, a ROUTER socket for state requests, and a PUB socket for outgoing updates.</p></li><li class="listitem"><p>The client uses a simple tickless timer to send a random update to the server once a second. In a real implementation, we would drive updates from application code.</p></li></ul></div></div><div class="sect2" title="Working with Subtrees"><div class="titlepage"><div><div><h3 class="title"><a id="idp20333464"></a>Working with Subtrees</h3></div></div></div><p>As we grow the number of clients, the size of our shared store will also grow. It stops being reasonable to send everything to every client. This is the classic story with pub-sub: when you have a very small number of clients, you can send every message to all clients. As you grow the architecture, this becomes inefficient. Clients specialize in different areas.</p><p>So even when working with a shared store, some clients will want to work only with a part of that store, which we call a <span class="emphasis"><em>subtree</em></span>. The client has to request the subtree when it makes a state request, and it must specify the same subtree when it subscribes to updates.</p><p>There are a couple of common syntaxes for trees. One is the <span class="emphasis"><em>path hierarchy</em></span>, and another is the <span class="emphasis"><em>topic tree</em></span>. These look like this:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Path hierarchy: <code class="literal">/some/list/of/paths</code></p></li><li class="listitem"><p>Topic tree: <code class="literal">some.list.of.topics</code></p></li></ul></div><p>We'll use the path hierarchy, and extend our client and server so that a client can work with a single subtree. Once you see how to work with a single subtree you'll be able to extend this yourself to handle multiple subtrees, if your use case demands it.</p><p>Here's the server implementing subtrees, a small variation on Model Three:</p><div class="example"><a id="clonesrv4-c"></a><p class="title"><strong>Example 5.34. Clone server, Model Four (clonesrv4.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Clone server - Model Four
+
+//  Lets us build this source without creating a library
+#include "kvsimple.c"
+
+//  Routing information for a key-value snapshot
+typedef struct {
+    void *socket;           //  ROUTER socket to send to
+    zframe_t *identity;     //  Identity of peer who requested state
+    char *subtree;          //  Client subtree specification
+} kvroute_t;
+
+//  Send one state snapshot key-value pair to a socket
+//  Hash item data is our kvmsg object, ready to send
+static int
+s_send_single (const char *key, void *data, void *args)
+{
+    kvroute_t *kvroute = (kvroute_t *) args;
+    kvmsg_t *kvmsg = (kvmsg_t *) data;
+    if (strlen (kvroute-&gt;subtree) &lt;= strlen (kvmsg_key (kvmsg))
+    &amp;&amp;  memcmp (kvroute-&gt;subtree,
+                kvmsg_key (kvmsg), strlen (kvroute-&gt;subtree)) == 0) {
+        //  Send identity of recipient first
+        zframe_send (&amp;kvroute-&gt;identity,
+            kvroute-&gt;socket, ZFRAME_MORE + ZFRAME_REUSE);
+        kvmsg_send (kvmsg, kvroute-&gt;socket);
+    }
+    return 0;
+}
+
+//  The main task is identical to clonesrv3 except for where it
+//  handles subtrees.
+...
+            //  Request is in second frame of message
+            char *request = zstr_recv (snapshot);
+            char *subtree = NULL;
+            if (streq (request, "ICANHAZ?")) {
+                free (request);
+                subtree = zstr_recv (snapshot);
+            }
+...
+            //  Send state snapshot to client
+            kvroute_t routing = { snapshot, identity, subtree };
+...
+            //  Now send END message with sequence number
+            printf ("I: sending shapshot=%d\n", (int) sequence);
+            zframe_send (&amp;identity, snapshot, ZFRAME_MORE);
+            kvmsg_t *kvmsg = kvmsg_new (sequence);
+            kvmsg_set_key  (kvmsg, "KTHXBAI");
+            kvmsg_set_body (kvmsg, (byte *) subtree, 0);
+            kvmsg_send     (kvmsg, snapshot);
+            kvmsg_destroy (&amp;kvmsg);
+            free (subtree);
+        }
+    }
+...
+</pre></div></div><br class="example-break" /><p>And here is the corresponding client:</p><div class="example"><a id="clonecli4-c"></a><p class="title"><strong>Example 5.35. Clone client, Model Four (clonecli4.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Clone client - Model Four
+
+//  Lets us build this source without creating a library
+#include "kvsimple.c"
+
+//  This client is identical to clonecli3 except for where we
+//  handles subtrees.
+#define SUBTREE "/client/"
+...
+    zsocket_connect (subscriber, "tcp://localhost:5557");
+    zsocket_set_subscribe (subscriber, SUBTREE);
+...
+    //  We first request a state snapshot:
+    int64_t sequence = 0;
+    zstr_sendm (snapshot, "ICANHAZ?");
+    zstr_send  (snapshot, SUBTREE);
+...
+        //  If we timed out, generate a random kvmsg
+        if (zclock_time () &gt;= alarm) {
+            kvmsg_t *kvmsg = kvmsg_new (0);
+            kvmsg_fmt_key  (kvmsg, "%s%d", SUBTREE, randof (10000));
+            kvmsg_fmt_body (kvmsg, "%d", randof (1000000));
+            kvmsg_send     (kvmsg, publisher);
+            kvmsg_destroy (&amp;kvmsg);
+            alarm = zclock_time () + 1000;
+        }
+...
+</pre></div></div><br class="example-break" /></div><div class="sect2" title="Ephemeral Values"><div class="titlepage"><div><div><h3 class="title"><a id="idp20345008"></a>Ephemeral Values</h3></div></div></div><p>An ephemeral value is one that expires automatically unless regularly refreshed. If you think of Clone being used for a registration service, then ephemeral values would let you do dynamic values. A node joins the network, publishes its address, and refreshes this regularly. If the node dies, its address eventually gets removed.</p><p>The usual abstraction for ephemeral values is to attach them to a <span class="emphasis"><em>session</em></span>, and delete them when the session ends. In Clone, sessions would be defined by clients, and would end if the client died. A simpler alternative is to attach a <span class="emphasis"><em>time to live</em></span> (TTL) to ephemeral values, which the server uses to expire values that haven't been refreshed in time.</p><p>A good design principle that I use whenever possible is to <span class="emphasis"><em>not invent concepts that are not absolutely essential</em></span>. If we have very large numbers of ephemeral values, sessions will offer better performance. If we use a handful of ephemeral values, it's fine to set a TTL on each one. If we use masses of ephemeral values, it's more efficient to attach them to sessions and expire them in bulk. This isn't a problem we face at this stage, and may never face, so sessions go out the window.</p><p>Now we will implement ephemeral values. First, we need a way to encode the TTL in the key-value message. We could add a frame. The problem with using ØMQ frames for properties is that each time we want to add a new property, we have to change the message structure. It breaks compatibility. So let's add a properties frame to the message, and write the code to let us get and put property values.</p><p>Next, we need a way to say, "delete this value". Up until now, servers and clients have always blindly inserted or updated new values into their hash table. We'll say that if the value is empty, that means "delete this key".</p><p>Here's a more complete version of the <code class="literal">kvmsg</code> class, which implements the properties frame (and adds a UUID frame, which we'll need later on). It also handles empty values by deleting the key from the hash, if necessary:</p><div class="example"><a id="kvmsg-c"></a><p class="title"><strong>Example 5.36. Key-value message class: full (kvmsg.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  kvmsg class - key-value message class for example applications
+
+#include "kvmsg.h"
+#include &lt;uuid/uuid.h&gt;
+#include "zlist.h"
+
+//  Keys are short strings
+#define KVMSG_KEY_MAX   255
+
+//  Message is formatted on wire as 4 frames:
+//  frame 0: key (0MQ string)
+//  frame 1: sequence (8 bytes, network order)
+//  frame 2: uuid (blob, 16 bytes)
+//  frame 3: properties (0MQ string)
+//  frame 4: body (blob)
+#define FRAME_KEY       0
+#define FRAME_SEQ       1
+#define FRAME_UUID      2
+#define FRAME_PROPS     3
+#define FRAME_BODY      4
+#define KVMSG_FRAMES    5
+
+//  Structure of our class
+struct _kvmsg {
+    //  Presence indicators for each frame
+    int present [KVMSG_FRAMES];
+    //  Corresponding 0MQ message frames, if any
+    zmq_msg_t frame [KVMSG_FRAMES];
+    //  Key, copied into safe C string
+    char key [KVMSG_KEY_MAX + 1];
+    //  List of properties, as name=value strings
+    zlist_t *props;
+    size_t props_size;
+};
+</pre></div></div><br class="example-break" /><p>These two helpers serialize a list of properties to and from a message frame: 
+</p><div class="example"><a id="kvmsg-c-1"></a><p class="title"><strong>Example 5.37. Key-value message class: full (kvmsg.c) - property encoding</strong></p><div class="example-contents"><pre class="programlisting">
+
+static void
+s_encode_props (kvmsg_t *self)
+{
+    zmq_msg_t *msg = &amp;self-&gt;frame [FRAME_PROPS];
+    if (self-&gt;present [FRAME_PROPS])
+        zmq_msg_close (msg);
+
+    zmq_msg_init_size (msg, self-&gt;props_size);
+    char *prop = zlist_first (self-&gt;props);
+    char *dest = (char *) zmq_msg_data (msg);
+    while (prop) {
+        strcpy (dest, prop);
+        dest += strlen (prop);
+        *dest++ = '\n';
+        prop = zlist_next (self-&gt;props);
+    }
+    self-&gt;present [FRAME_PROPS] = 1;
+}
+
+static void
+s_decode_props (kvmsg_t *self)
+{
+    zmq_msg_t *msg = &amp;self-&gt;frame [FRAME_PROPS];
+    self-&gt;props_size = 0;
+    while (zlist_size (self-&gt;props))
+        free (zlist_pop (self-&gt;props));
+
+    size_t remainder = zmq_msg_size (msg);
+    char *prop = (char *) zmq_msg_data (msg);
+    char *eoln = memchr (prop, '\n', remainder);
+    while (eoln) {
+        *eoln = 0;
+        zlist_append (self-&gt;props, strdup (prop));
+        self-&gt;props_size += strlen (prop) + 1;
+        remainder -= strlen (prop) + 1;
+        prop = eoln + 1;
+        eoln = memchr (prop, '\n', remainder);
+    }
+}
+</pre></div></div><br class="example-break" /><p>Here are the constructor and destructor for the class: 
+</p><div class="example"><a id="kvmsg-c-2"></a><p class="title"><strong>Example 5.38. Key-value message class: full (kvmsg.c) - constructor and destructor</strong></p><div class="example-contents"><pre class="programlisting">
+
+//  Constructor, takes a sequence number for the new kvmsg instance:
+kvmsg_t *
+kvmsg_new (int64_t sequence)
+{
+    kvmsg_t
+        *self;
+
+    self = (kvmsg_t *) zmalloc (sizeof (kvmsg_t));
+    self-&gt;props = zlist_new ();
+    kvmsg_set_sequence (self, sequence);
+    return self;
+}
+
+//  zhash_free_fn callback helper that does the low level destruction:
+void
+kvmsg_free (void *ptr)
+{
+    if (ptr) {
+        kvmsg_t *self = (kvmsg_t *) ptr;
+        //  Destroy message frames if any
+        int frame_nbr;
+        for (frame_nbr = 0; frame_nbr &lt; KVMSG_FRAMES; frame_nbr++)
+            if (self-&gt;present [frame_nbr])
+                zmq_msg_close (&amp;self-&gt;frame [frame_nbr]);
+
+        //  Destroy property list
+        while (zlist_size (self-&gt;props))
+            free (zlist_pop (self-&gt;props));
+        zlist_destroy (&amp;self-&gt;props);
+
+        //  Free object itself
+        free (self);
+    }
+}
+
+//  Destructor
+void
+kvmsg_destroy (kvmsg_t **self_p)
+{
+    assert (self_p);
+    if (*self_p) {
+        kvmsg_free (*self_p);
+        *self_p = NULL;
+    }
+}
+</pre></div></div><br class="example-break" /><p>This method reads a key-value message from the socket and returns a new <code class="literal">kvmsg</code> instance: 
+</p><div class="example"><a id="kvmsg-c-3"></a><p class="title"><strong>Example 5.39. Key-value message class: full (kvmsg.c) - recv method</strong></p><div class="example-contents"><pre class="programlisting">
+
+kvmsg_t *
+kvmsg_recv (void *socket)
+{
+    //  This method is almost unchanged from kvsimple
+...
+    if (self)
+        s_decode_props (self);
+    return self;
+}
+
+//  Send key-value message to socket; any empty frames are sent as such.
+void
+kvmsg_send (kvmsg_t *self, void *socket)
+{
+    assert (self);
+    assert (socket);
+
+    s_encode_props (self);
+    //  The rest of the method is unchanged from kvsimple
+...
+</pre></div></div><br class="example-break" /><p>This method duplicates a <code class="literal">kvmsg</code> instance, returns the new instance: 
+</p><div class="example"><a id="kvmsg-c-4"></a><p class="title"><strong>Example 5.40. Key-value message class: full (kvmsg.c) - dup method</strong></p><div class="example-contents"><pre class="programlisting">
+
+kvmsg_t *
+kvmsg_dup (kvmsg_t *self)
+{
+    kvmsg_t *kvmsg = kvmsg_new (0);
+    int frame_nbr;
+    for (frame_nbr = 0; frame_nbr &lt; KVMSG_FRAMES; frame_nbr++) {
+        if (self-&gt;present [frame_nbr]) {
+            zmq_msg_t *src = &amp;self-&gt;frame [frame_nbr];
+            zmq_msg_t *dst = &amp;kvmsg-&gt;frame [frame_nbr];
+            zmq_msg_init_size (dst, zmq_msg_size (src));
+            memcpy (zmq_msg_data (dst),
+                    zmq_msg_data (src), zmq_msg_size (src));
+            kvmsg-&gt;present [frame_nbr] = 1;
+        }
+    }
+    kvmsg-&gt;props_size = zlist_size (self-&gt;props);
+    char *prop = (char *) zlist_first (self-&gt;props);
+    while (prop) {
+        zlist_append (kvmsg-&gt;props, strdup (prop));
+        prop = (char *) zlist_next (self-&gt;props);
+    }
+    return kvmsg;
+}
+
+//  The key, sequence, body, and size methods are the same as in kvsimple.
+...
+</pre></div></div><br class="example-break" /><p>These methods get and set the UUID for the key-value message: 
+</p><div class="example"><a id="kvmsg-c-5"></a><p class="title"><strong>Example 5.41. Key-value message class: full (kvmsg.c) - UUID methods</strong></p><div class="example-contents"><pre class="programlisting">
+
+byte *
+kvmsg_uuid (kvmsg_t *self)
+{
+    assert (self);
+    if (self-&gt;present [FRAME_UUID]
+    &amp;&amp;  zmq_msg_size (&amp;self-&gt;frame [FRAME_UUID]) == sizeof (uuid_t))
+        return (byte *) zmq_msg_data (&amp;self-&gt;frame [FRAME_UUID]);
+    else
+        return NULL;
+}
+
+//  Sets the UUID to a randomly generated value
+void
+kvmsg_set_uuid (kvmsg_t *self)
+{
+    assert (self);
+    zmq_msg_t *msg = &amp;self-&gt;frame [FRAME_UUID];
+    uuid_t uuid;
+    uuid_generate (uuid);
+    if (self-&gt;present [FRAME_UUID])
+        zmq_msg_close (msg);
+    zmq_msg_init_size (msg, sizeof (uuid));
+    memcpy (zmq_msg_data (msg), uuid, sizeof (uuid));
+    self-&gt;present [FRAME_UUID] = 1;
+}
+</pre></div></div><br class="example-break" /><p>These methods get and set a specified message property: 
+</p><div class="example"><a id="kvmsg-c-6"></a><p class="title"><strong>Example 5.42. Key-value message class: full (kvmsg.c) - property methods</strong></p><div class="example-contents"><pre class="programlisting">
+
+//  Get message property, return "" if no such property is defined.
+char *
+kvmsg_get_prop (kvmsg_t *self, char *name)
+{
+    assert (strchr (name, '=') == NULL);
+    char *prop = zlist_first (self-&gt;props);
+    size_t namelen = strlen (name);
+    while (prop) {
+        if (strlen (prop) &gt; namelen
+        &amp;&amp;  memcmp (prop, name, namelen) == 0
+        &amp;&amp;  prop [namelen] == '=')
+            return prop + namelen + 1;
+        prop = zlist_next (self-&gt;props);
+    }
+    return "";
+}
+
+//  Set message property. Property name cannot contain '='. Max length of
+//  value is 255 chars.
+void
+kvmsg_set_prop (kvmsg_t *self, char *name, char *format, ...)
+{
+    assert (strchr (name, '=') == NULL);
+
+    char value [255 + 1];
+    va_list args;
+    assert (self);
+    va_start (args, format);
+    vsnprintf (value, 255, format, args);
+    va_end (args);
+
+    //  Allocate name=value string
+    char *prop = malloc (strlen (name) + strlen (value) + 2);
+
+    //  Remove existing property if any
+    sprintf (prop, "%s=", name);
+    char *existing = zlist_first (self-&gt;props);
+    while (existing) {
+        if (memcmp (prop, existing, strlen (prop)) == 0) {
+            self-&gt;props_size -= strlen (existing) + 1;
+            zlist_remove (self-&gt;props, existing);
+            free (existing);
+            break;
+        }
+        existing = zlist_next (self-&gt;props);
+    }
+    //  Add new name=value property string
+    strcat (prop, value);
+    zlist_append (self-&gt;props, prop);
+    self-&gt;props_size += strlen (prop) + 1;
+}
+</pre></div></div><br class="example-break" /><p>This method stores the key-value message into a hash map, unless the key and value are both null. It nullifies the <code class="literal">kvmsg</code> reference so that the object is owned by the hash map, not the caller: 
+</p><div class="example"><a id="kvmsg-c-7"></a><p class="title"><strong>Example 5.43. Key-value message class: full (kvmsg.c) - store method</strong></p><div class="example-contents"><pre class="programlisting">
+
+void
+kvmsg_store (kvmsg_t **self_p, zhash_t *hash)
+{
+    assert (self_p);
+    if (*self_p) {
+        kvmsg_t *self = *self_p;
+        assert (self);
+        if (kvmsg_size (self)) {
+            if (self-&gt;present [FRAME_KEY]
+            &amp;&amp;  self-&gt;present [FRAME_BODY]) {
+                zhash_update (hash, kvmsg_key (self), self);
+                zhash_freefn (hash, kvmsg_key (self), kvmsg_free);
+            }
+        }
+        else
+            zhash_delete (hash, kvmsg_key (self));
+
+        *self_p = NULL;
+    }
+}
+</pre></div></div><br class="example-break" /><p>This method extends the <code class="literal">kvsimple</code> implementation with support for message properties: 
+</p><div class="example"><a id="kvmsg-c-8"></a><p class="title"><strong>Example 5.44. Key-value message class: full (kvmsg.c) - dump method</strong></p><div class="example-contents"><pre class="programlisting">
+
+void
+kvmsg_dump (kvmsg_t *self)
+{
+...
+        fprintf (stderr, "[size:%zd] ", size);
+        if (zlist_size (self-&gt;props)) {
+            fprintf (stderr, "[");
+            char *prop = zlist_first (self-&gt;props);
+            while (prop) {
+                fprintf (stderr, "%s;", prop);
+                prop = zlist_next (self-&gt;props);
+            }
+            fprintf (stderr, "]");
+        }
+...
+</pre></div></div><br class="example-break" /><p>This method is the same as in <code class="literal">kvsimple</code> with added support for the uuid and property features of <code class="literal">kvmsg</code>: 
+</p><div class="example"><a id="kvmsg-c-9"></a><p class="title"><strong>Example 5.45. Key-value message class: full (kvmsg.c) - test method</strong></p><div class="example-contents"><pre class="programlisting">
+
+int
+kvmsg_test (int verbose)
+{
+...
+    //  Test send and receive of simple message
+    kvmsg = kvmsg_new (1);
+    kvmsg_set_key  (kvmsg, "key");
+    kvmsg_set_uuid (kvmsg);
+    kvmsg_set_body (kvmsg, (byte *) "body", 4);
+    if (verbose)
+        kvmsg_dump (kvmsg);
+    kvmsg_send (kvmsg, output);
+    kvmsg_store (&amp;kvmsg, kvmap);
+
+    kvmsg = kvmsg_recv (input);
+    if (verbose)
+        kvmsg_dump (kvmsg);
+    assert (streq (kvmsg_key (kvmsg), "key"));
+    kvmsg_store (&amp;kvmsg, kvmap);
+
+    //  Test send and receive of message with properties
+    kvmsg = kvmsg_new (2);
+    kvmsg_set_prop (kvmsg, "prop1", "value1");
+    kvmsg_set_prop (kvmsg, "prop2", "value1");
+    kvmsg_set_prop (kvmsg, "prop2", "value2");
+    kvmsg_set_key  (kvmsg, "key");
+    kvmsg_set_uuid (kvmsg);
+    kvmsg_set_body (kvmsg, (byte *) "body", 4);
+    assert (streq (kvmsg_get_prop (kvmsg, "prop2"), "value2"));
+    if (verbose)
+        kvmsg_dump (kvmsg);
+    kvmsg_send (kvmsg, output);
+    kvmsg_destroy (&amp;kvmsg);
+
+    kvmsg = kvmsg_recv (input);
+    if (verbose)
+        kvmsg_dump (kvmsg);
+    assert (streq (kvmsg_key (kvmsg), "key"));
+    assert (streq (kvmsg_get_prop (kvmsg, "prop2"), "value2"));
+    kvmsg_destroy (&amp;kvmsg);
+...
+</pre></div></div><br class="example-break" /><p>The Model Five client is almost identical to Model Four. It uses the full <code class="literal">kvmsg</code> class now, and sets a randomized <code class="literal">ttl</code> property (measured in seconds) on each message:</p><pre class="programlisting">
+kvmsg_set_prop (kvmsg, "ttl", "%d", randof (30));
+</pre></div><div class="sect2" title="Using a Reactor"><div class="titlepage"><div><div><h3 class="title"><a id="idp20381608"></a>Using a Reactor</h3></div></div></div><p>Until now, we have used a poll loop in the server. In this next model of the server, we switch to using a reactor. In C, we use CZMQ's <code class="literal">zloop</code> class. Using a reactor makes the code more verbose, but easier to understand and build out because each piece of the server is handled by a separate reactor handler.</p><p>We use a single thread and pass a server object around to the reactor handlers. We could have organized the server as multiple threads, each handling one socket or timer, but that works better when threads don't have to share data. In this case all work is centered around the server's hashmap, so one thread is simpler.</p><p>There are three reactor handlers:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>One to handle snapshot requests coming on the ROUTER socket;</p></li><li class="listitem"><p>One to handle incoming updates from clients, coming on the PULL socket;</p></li><li class="listitem"><p>One to expire ephemeral values that have passed their TTL.</p></li></ul></div><div class="example"><a id="clonesrv5-c"></a><p class="title"><strong>Example 5.46. Clone server, Model Five (clonesrv5.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Clone server - Model Five
+
+//  Lets us build this source without creating a library
+#include "kvmsg.c"
+
+//  zloop reactor handlers
+static int s_snapshots (zloop_t *loop, zmq_pollitem_t *poller, void *args);
+static int s_collector (zloop_t *loop, zmq_pollitem_t *poller, void *args);
+static int s_flush_ttl (zloop_t *loop, zmq_pollitem_t *poller, void *args);
+
+//  Our server is defined by these properties
+typedef struct {
+    zctx_t *ctx;                //  Context wrapper
+    zhash_t *kvmap;             //  Key-value store
+    zloop_t *loop;              //  zloop reactor
+    int port;                   //  Main port we're working on
+    int64_t sequence;           //  How many updates we're at
+    void *snapshot;             //  Handle snapshot requests
+    void *publisher;            //  Publish updates to clients
+    void *collector;            //  Collect updates from clients
+} clonesrv_t;
+
+int main (void)
+{
+    clonesrv_t *self = (clonesrv_t *) zmalloc (sizeof (clonesrv_t));
+    self-&gt;port = 5556;
+    self-&gt;ctx = zctx_new ();
+    self-&gt;kvmap = zhash_new ();
+    self-&gt;loop = zloop_new ();
+    zloop_set_verbose (self-&gt;loop, false);
+
+    //  Set up our clone server sockets
+    self-&gt;snapshot  = zsocket_new (self-&gt;ctx, ZMQ_ROUTER);
+    zsocket_bind (self-&gt;snapshot,  "tcp://*:%d", self-&gt;port);
+    self-&gt;publisher = zsocket_new (self-&gt;ctx, ZMQ_PUB);
+    zsocket_bind (self-&gt;publisher, "tcp://*:%d", self-&gt;port + 1);
+    self-&gt;collector = zsocket_new (self-&gt;ctx, ZMQ_PULL);
+    zsocket_bind (self-&gt;collector, "tcp://*:%d", self-&gt;port + 2);
+
+    //  Register our handlers with reactor
+    zmq_pollitem_t poller = { 0, 0, ZMQ_POLLIN };
+    poller.socket = self-&gt;snapshot;
+    zloop_poller (self-&gt;loop, &amp;poller, s_snapshots, self);
+    poller.socket = self-&gt;collector;
+    zloop_poller (self-&gt;loop, &amp;poller, s_collector, self);
+    zloop_timer (self-&gt;loop, 1000, 0, s_flush_ttl, self);
+
+    //  Run reactor until process interrupted
+    zloop_start (self-&gt;loop);
+
+    zloop_destroy (&amp;self-&gt;loop);
+    zhash_destroy (&amp;self-&gt;kvmap);
+    zctx_destroy (&amp;self-&gt;ctx);
+    free (self);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>We handle ICANHAZ? requests by sending snapshot data to the client that requested it: 
+</p><div class="example"><a id="clonesrv5-c-1"></a><p class="title"><strong>Example 5.47. Clone server, Model Five (clonesrv5.c) - send snapshots</strong></p><div class="example-contents"><pre class="programlisting">
+
+//  Routing information for a key-value snapshot
+typedef struct {
+    void *socket;           //  ROUTER socket to send to
+    zframe_t *identity;     //  Identity of peer who requested state
+    char *subtree;          //  Client subtree specification
+} kvroute_t;
+
+//  We call this function for each key-value pair in our hash table
+static int
+s_send_single (const char *key, void *data, void *args)
+{
+    kvroute_t *kvroute = (kvroute_t *) args;
+    kvmsg_t *kvmsg = (kvmsg_t *) data;
+    if (strlen (kvroute-&gt;subtree) &lt;= strlen (kvmsg_key (kvmsg))
+    &amp;&amp;  memcmp (kvroute-&gt;subtree,
+                kvmsg_key (kvmsg), strlen (kvroute-&gt;subtree)) == 0) {
+        zframe_send (&amp;kvroute-&gt;identity,    //  Choose recipient
+            kvroute-&gt;socket, ZFRAME_MORE + ZFRAME_REUSE);
+        kvmsg_send (kvmsg, kvroute-&gt;socket);
+    }
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>This is the reactor handler for the snapshot socket; it accepts just the ICANHAZ? request and replies with a state snapshot ending with a KTHXBAI message: 
+</p><div class="example"><a id="clonesrv5-c-2"></a><p class="title"><strong>Example 5.48. Clone server, Model Five (clonesrv5.c) - snapshot handler</strong></p><div class="example-contents"><pre class="programlisting">
+
+static int
+s_snapshots (zloop_t *loop, zmq_pollitem_t *poller, void *args)
+{
+    clonesrv_t *self = (clonesrv_t *) args;
+
+    zframe_t *identity = zframe_recv (poller-&gt;socket);
+    if (identity) {
+        //  Request is in second frame of message
+        char *request = zstr_recv (poller-&gt;socket);
+        char *subtree = NULL;
+        if (streq (request, "ICANHAZ?")) {
+            free (request);
+            subtree = zstr_recv (poller-&gt;socket);
+        }
+        else
+            printf ("E: bad request, aborting\n");
+
+        if (subtree) {
+            //  Send state socket to client
+            kvroute_t routing = { poller-&gt;socket, identity, subtree };
+            zhash_foreach (self-&gt;kvmap, s_send_single, &amp;routing);
+
+            //  Now send END message with sequence number
+            zclock_log ("I: sending shapshot=%d", (int) self-&gt;sequence);
+            zframe_send (&amp;identity, poller-&gt;socket, ZFRAME_MORE);
+            kvmsg_t *kvmsg = kvmsg_new (self-&gt;sequence);
+            kvmsg_set_key  (kvmsg, "KTHXBAI");
+            kvmsg_set_body (kvmsg, (byte *) subtree, 0);
+            kvmsg_send     (kvmsg, poller-&gt;socket);
+            kvmsg_destroy (&amp;kvmsg);
+            free (subtree);
+        }
+        zframe_destroy(&amp;identity);
+    }
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>We store each update with a new sequence number, and if necessary, a time-to-live. We publish updates immediately on our publisher socket: 
+</p><div class="example"><a id="clonesrv5-c-3"></a><p class="title"><strong>Example 5.49. Clone server, Model Five (clonesrv5.c) - collect updates</strong></p><div class="example-contents"><pre class="programlisting">
+
+static int
+s_collector (zloop_t *loop, zmq_pollitem_t *poller, void *args)
+{
+    clonesrv_t *self = (clonesrv_t *) args;
+
+    kvmsg_t *kvmsg = kvmsg_recv (poller-&gt;socket);
+    if (kvmsg) {
+        kvmsg_set_sequence (kvmsg, ++self-&gt;sequence);
+        kvmsg_send (kvmsg, self-&gt;publisher);
+        int ttl = atoi (kvmsg_get_prop (kvmsg, "ttl"));
+        if (ttl)
+            kvmsg_set_prop (kvmsg, "ttl",
+                "%" PRId64, zclock_time () + ttl * 1000);
+        kvmsg_store (&amp;kvmsg, self-&gt;kvmap);
+        zclock_log ("I: publishing update=%d", (int) self-&gt;sequence);
+    }
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>At regular intervals, we flush ephemeral values that have expired. This could be slow on very large data sets: 
+</p><div class="example"><a id="clonesrv5-c-4"></a><p class="title"><strong>Example 5.50. Clone server, Model Five (clonesrv5.c) - flush ephemeral values</strong></p><div class="example-contents"><pre class="programlisting">
+
+//  If key-value pair has expired, delete it and publish the
+//  fact to listening clients.
+static int
+s_flush_single (const char *key, void *data, void *args)
+{
+    clonesrv_t *self = (clonesrv_t *) args;
+
+    kvmsg_t *kvmsg = (kvmsg_t *) data;
+    int64_t ttl;
+    sscanf (kvmsg_get_prop (kvmsg, "ttl"), "%" PRId64, &amp;ttl);
+    if (ttl &amp;&amp; zclock_time () &gt;= ttl) {
+        kvmsg_set_sequence (kvmsg, ++self-&gt;sequence);
+        kvmsg_set_body (kvmsg, (byte *) "", 0);
+        kvmsg_send (kvmsg, self-&gt;publisher);
+        kvmsg_store (&amp;kvmsg, self-&gt;kvmap);
+        zclock_log ("I: publishing delete=%d", (int) self-&gt;sequence);
+    }
+    return 0;
+}
+
+static int
+s_flush_ttl (zloop_t *loop, zmq_pollitem_t *poller, void *args)
+{
+    clonesrv_t *self = (clonesrv_t *) args;
+    if (self-&gt;kvmap)
+        zhash_foreach (self-&gt;kvmap, s_flush_single, args);
+    return 0;
+}
+</pre></div></div><br class="example-break" /></div><div class="sect2" title="Adding the Binary Star Pattern for Reliability"><div class="titlepage"><div><div><h3 class="title"><a id="idp20401168"></a>Adding the Binary Star Pattern for Reliability</h3></div></div></div><p>The Clone models we've explored up to now have been relatively simple. Now we're going to get into unpleasantly complex territory, which has me getting up for another espresso. You should appreciate that making "reliable" messaging is complex enough that you always need to ask, "Do we actually need this?" before jumping into it. If you can get away with unreliable or with "good enough" reliability, you can make a huge win in terms of cost and complexity. Sure, you may lose some data now and then. It is often a good trade-off. Having said, that, and... sips... because the espresso is really good, let's jump in.</p><p>As you play with the last model, you'll stop and restart the server. It might look like it recovers, but of course it's applying updates to an empty state instead of the proper current state. Any new client joining the network will only get the latest updates instead of the full historical record.</p><p>What we want is a way for the server to recover from being killed, or crashing. We also need to provide backup in case the server is out of commission for any length of time. When someone asks for "reliability", ask them to list the failures they want to handle. In our case, these are:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The server process crashes and is automatically or manually restarted. The process loses its state and has to get it back from somewhere.</p></li><li class="listitem"><p>The server machine dies and is offline for a significant time. Clients have to switch to an alternate server somewhere.</p></li><li class="listitem"><p>The server process or machine gets disconnected from the network, e.g., a switch dies or a datacenter gets knocked out. It may come back at some point, but in the meantime clients need an alternate server.</p></li></ul></div><p>Our first step is to add a second server. We can use the Binary Star pattern from Reliable Request-Reply Patterns<a class="xref" href="ch04.html" title="Chapter 4. Reliable Request-Reply Patterns">Chapter 4, <em>Reliable Request-Reply Patterns</em></a> to organize these into primary and backup. Binary Star is a reactor, so it's useful that we already refactored the last server model into a reactor style.</p><p>We need to ensure that updates are not lost if the primary server crashes. The simplest technique is to send them to both servers. The backup server can then act as a client, and keep its state synchronized by receiving updates as all clients do. It'll also get new updates from clients. It can't yet store these in its hash table, but it can hold onto them for a while.</p><p>So, Model Six introduces the following changes over Model Five:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>We use a pub-sub flow instead of a push-pull flow for client updates sent to the servers. This takes care of fanning out the updates to both servers. Otherwise we'd have to use two DEALER sockets.</p></li><li class="listitem"><p>We add heartbeats to server updates (to clients), so that a client can detect when the primary server has died. It can then switch over to the backup server.</p></li><li class="listitem"><p>We connect the two servers using the Binary Star <code class="literal">bstar</code> reactor class. Binary Star relies on the clients to vote by making an explicit request to the server they consider active. We'll use snapshot requests as the voting mechanism.</p></li><li class="listitem"><p>We make all update messages uniquely identifiable by adding a UUID field. The client generates this, and the server propagates it back on republished updates.</p></li><li class="listitem"><p>The passive server keeps a "pending list" of updates that it has received from clients, but not yet from the active server; or updates it's received from the active server, but not yet from the clients. The list is ordered from oldest to newest, so that it is easy to remove updates off the head.</p></li></ul></div><div class="figure"><a id="figure-61"></a><p class="title"><strong>Figure 5.6. Clone Client Finite State Machine</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig61.png" alt="Clone Client Finite State Machine" /></div></div></div><br class="figure-break" /><p>It's useful to design the client logic as a finite state machine. The client cycles through three states:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The client opens and connects its sockets, and then requests a snapshot from the first server. To avoid request storms, it will ask any given server only twice. One request might get lost, which would be bad luck. Two getting lost would be carelessness.</p></li><li class="listitem"><p>The client waits for a reply (snapshot data) from the current server, and if it gets it, it stores it. If there is no reply within some timeout, it fails over to the next server.</p></li><li class="listitem"><p>When the client has gotten its snapshot, it waits for and processes updates. Again, if it doesn't hear anything from the server within some timeout, it fails over to the next server.</p></li></ul></div><p>The client loops forever. It's quite likely during startup or failover that some clients may be trying to talk to the primary server while others are trying to talk to the backup server. The Binary Star state machine handles this<a class="xref" href="ch05s06.html#figure-62" title="Figure 5.7. High-availability Clone Server Pair">Figure 5.7, “High-availability Clone Server Pair”</a>, hopefully accurately. It's hard to prove software correct; instead we hammer it until we can't prove it wrong.</p><p>Failover happens as follows:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The client detects that primary server is no longer sending heartbeats, and concludes that it has died. The client connects to the backup server and requests a new state snapshot.</p></li><li class="listitem"><p>The backup server starts to receive snapshot requests from clients, and detects that primary server has gone, so it takes over as primary.</p></li><li class="listitem"><p>The backup server applies its pending list to its own hash table, and then starts to process state snapshot requests.</p></li></ul></div><p>When the primary server comes back online, it will:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Start up as passive server, and connect to the backup server as a Clone client.</p></li><li class="listitem"><p>Start to receive updates from clients, via its SUB socket.</p></li></ul></div><p>We make a few assumptions:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>At least one server will keep running. If both servers crash, we lose all server state and there's no way to recover it.</p></li><li class="listitem"><p>Multiple clients do not update the same hash keys at the same time. Client updates will arrive at the two servers in a different order. Therefore, the backup server may apply updates from its pending list in a different order than the primary server would or did. Updates from one client will always arrive in the same order on both servers, so that is safe.</p></li></ul></div><p>Thus the architecture for our high-availability server pair using the Binary Star pattern has two servers and a set of clients that talk to both servers<a class="xref" href="ch05s06.html#figure-62" title="Figure 5.7. High-availability Clone Server Pair">Figure 5.7, “High-availability Clone Server Pair”</a>.</p><div class="figure"><a id="figure-62"></a><p class="title"><strong>Figure 5.7. High-availability Clone Server Pair</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig62.png" alt="High-availability Clone Server Pair" /></div></div></div><br class="figure-break" /><p>Here is the sixth and last model of the Clone server:</p><div class="example"><a id="clonesrv6-c"></a><p class="title"><strong>Example 5.51. Clone server, Model Six (clonesrv6.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Clone server Model Six
+
+//  Lets us build this source without creating a library
+#include "bstar.c"
+#include "kvmsg.c"
+</pre></div></div><br class="example-break" /><p>We define a set of reactor handlers and our server object structure: 
+</p><div class="example"><a id="clonesrv6-c-1"></a><p class="title"><strong>Example 5.52. Clone server, Model Six (clonesrv6.c) - definitions</strong></p><div class="example-contents"><pre class="programlisting">
+
+//  Bstar reactor handlers
+static int
+    s_snapshots   (zloop_t *loop, zmq_pollitem_t *poller, void *args);
+static int
+    s_collector   (zloop_t *loop, zmq_pollitem_t *poller, void *args);
+static int
+    s_flush_ttl   (zloop_t *loop, zmq_pollitem_t *poller, void *args);
+static int
+    s_send_hugz   (zloop_t *loop, zmq_pollitem_t *poller, void *args);
+static int
+    s_new_active  (zloop_t *loop, zmq_pollitem_t *poller, void *args);
+static int
+    s_new_passive (zloop_t *loop, zmq_pollitem_t *poller, void *args);
+static int
+    s_subscriber  (zloop_t *loop, zmq_pollitem_t *poller, void *args);
+
+//  Our server is defined by these properties
+typedef struct {
+    zctx_t *ctx;                //  Context wrapper
+    zhash_t *kvmap;             //  Key-value store
+    bstar_t *bstar;             //  Bstar reactor core
+    int64_t sequence;           //  How many updates we're at
+    int port;                   //  Main port we're working on
+    int peer;                   //  Main port of our peer
+    void *publisher;            //  Publish updates and hugz
+    void *collector;            //  Collect updates from clients
+    void *subscriber;           //  Get updates from peer
+    zlist_t *pending;           //  Pending updates from clients
+    bool primary;               //  true if we're primary
+    bool active;                //  true if we're active
+    bool passive;               //  true if we're passive
+} clonesrv_t;
+</pre></div></div><br class="example-break" /><p>The main task parses the command line to decide whether to start as a primary or backup server. We're using the Binary Star pattern for reliability. This interconnects the two servers so they can agree on which one is primary and which one is backup. To allow the two servers to run on the same box, we use different ports for primary and backup. Ports 5003/5004 are used to interconnect the servers. Ports 5556/5566 are used to receive voting events (snapshot requests in the clone pattern). Ports 5557/5567 are used by the publisher, and ports 5558/5568 are used by the collector: 
+</p><div class="example"><a id="clonesrv6-c-2"></a><p class="title"><strong>Example 5.53. Clone server, Model Six (clonesrv6.c) - main task setup</strong></p><div class="example-contents"><pre class="programlisting">
+
+int main (int argc, char *argv [])
+{
+    clonesrv_t *self = (clonesrv_t *) zmalloc (sizeof (clonesrv_t));
+    if (argc == 2 &amp;&amp; streq (argv [1], "-p")) {
+        zclock_log ("I: primary active, waiting for backup (passive)");
+        self-&gt;bstar = bstar_new (BSTAR_PRIMARY, "tcp://*:5003",
+                                 "tcp://localhost:5004");
+        bstar_voter (self-&gt;bstar, "tcp://*:5556",
+                     ZMQ_ROUTER, s_snapshots, self);
+        self-&gt;port = 5556;
+        self-&gt;peer = 5566;
+        self-&gt;primary = true;
+    }
+    else
+    if (argc == 2 &amp;&amp; streq (argv [1], "-b")) {
+        zclock_log ("I: backup passive, waiting for primary (active)");
+        self-&gt;bstar = bstar_new (BSTAR_BACKUP, "tcp://*:5004",
+                                 "tcp://localhost:5003");
+        bstar_voter (self-&gt;bstar, "tcp://*:5566",
+                     ZMQ_ROUTER, s_snapshots, self);
+        self-&gt;port = 5566;
+        self-&gt;peer = 5556;
+        self-&gt;primary = false;
+    }
+    else {
+        printf ("Usage: clonesrv4 { -p | -b }\n");
+        free (self);
+        exit (0);
+    }
+    //  Primary server will become first active
+    if (self-&gt;primary)
+        self-&gt;kvmap = zhash_new ();
+
+    self-&gt;ctx = zctx_new ();
+    self-&gt;pending = zlist_new ();
+    bstar_set_verbose (self-&gt;bstar, true);
+
+    //  Set up our clone server sockets
+    self-&gt;publisher = zsocket_new (self-&gt;ctx, ZMQ_PUB);
+    self-&gt;collector = zsocket_new (self-&gt;ctx, ZMQ_SUB);
+    zsocket_set_subscribe (self-&gt;collector, "");
+    zsocket_bind (self-&gt;publisher, "tcp://*:%d", self-&gt;port + 1);
+    zsocket_bind (self-&gt;collector, "tcp://*:%d", self-&gt;port + 2);
+
+    //  Set up our own clone client interface to peer
+    self-&gt;subscriber = zsocket_new (self-&gt;ctx, ZMQ_SUB);
+    zsocket_set_subscribe (self-&gt;subscriber, "");
+    zsocket_connect (self-&gt;subscriber,
+                     "tcp://localhost:%d", self-&gt;peer + 1);
+</pre></div></div><br class="example-break" /><p>After we've setup our sockets, we register our binary star event handlers, and then start the bstar reactor. This finishes when the user presses Ctrl-C or when the process receives a SIGINT interrupt: 
+</p><div class="example"><a id="clonesrv6-c-3"></a><p class="title"><strong>Example 5.54. Clone server, Model Six (clonesrv6.c) - main task body</strong></p><div class="example-contents"><pre class="programlisting">
+
+    //  Register state change handlers
+    bstar_new_active (self-&gt;bstar, s_new_active, self);
+    bstar_new_passive (self-&gt;bstar, s_new_passive, self);
+
+    //  Register our other handlers with the bstar reactor
+    zmq_pollitem_t poller = { self-&gt;collector, 0, ZMQ_POLLIN };
+    zloop_poller (bstar_zloop (self-&gt;bstar), &amp;poller, s_collector, self);
+    zloop_timer  (bstar_zloop (self-&gt;bstar), 1000, 0, s_flush_ttl, self);
+    zloop_timer  (bstar_zloop (self-&gt;bstar), 1000, 0, s_send_hugz, self);
+
+    //  Start the bstar reactor
+    bstar_start (self-&gt;bstar);
+
+    //  Interrupted, so shut down
+    while (zlist_size (self-&gt;pending)) {
+        kvmsg_t *kvmsg = (kvmsg_t *) zlist_pop (self-&gt;pending);
+        kvmsg_destroy (&amp;kvmsg);
+    }
+    zlist_destroy (&amp;self-&gt;pending);
+    bstar_destroy (&amp;self-&gt;bstar);
+    zhash_destroy (&amp;self-&gt;kvmap);
+    zctx_destroy (&amp;self-&gt;ctx);
+    free (self);
+
+    return 0;
+}
+
+//  We handle ICANHAZ? requests exactly as in the clonesrv5 example.
+...
+</pre></div></div><br class="example-break" /><p>The collector is more complex than in the clonesrv5 example because the way it processes updates depends on whether we're active or passive. The active applies them immediately to its kvmap, whereas the passive queues them as pending: 
+</p><div class="example"><a id="clonesrv6-c-4"></a><p class="title"><strong>Example 5.55. Clone server, Model Six (clonesrv6.c) - collect updates</strong></p><div class="example-contents"><pre class="programlisting">
+
+//  If message was already on pending list, remove it and return true,
+//  else return false.
+static int
+s_was_pending (clonesrv_t *self, kvmsg_t *kvmsg)
+{
+    kvmsg_t *held = (kvmsg_t *) zlist_first (self-&gt;pending);
+    while (held) {
+        if (memcmp (kvmsg_uuid (kvmsg),
+                    kvmsg_uuid (held), sizeof (uuid_t)) == 0) {
+            zlist_remove (self-&gt;pending, held);
+            return true;
+        }
+        held = (kvmsg_t *) zlist_next (self-&gt;pending);
+    }
+    return false;
+}
+
+static int
+s_collector (zloop_t *loop, zmq_pollitem_t *poller, void *args)
+{
+    clonesrv_t *self = (clonesrv_t *) args;
+
+    kvmsg_t *kvmsg = kvmsg_recv (poller-&gt;socket);
+    if (kvmsg) {
+        if (self-&gt;active) {
+            kvmsg_set_sequence (kvmsg, ++self-&gt;sequence);
+            kvmsg_send (kvmsg, self-&gt;publisher);
+            int ttl = atoi (kvmsg_get_prop (kvmsg, "ttl"));
+            if (ttl)
+                kvmsg_set_prop (kvmsg, "ttl",
+                    "%" PRId64, zclock_time () + ttl * 1000);
+            kvmsg_store (&amp;kvmsg, self-&gt;kvmap);
+            zclock_log ("I: publishing update=%d", (int) self-&gt;sequence);
+        }
+        else {
+            //  If we already got message from active, drop it, else
+            //  hold on pending list
+            if (s_was_pending (self, kvmsg))
+                kvmsg_destroy (&amp;kvmsg);
+            else
+                zlist_append (self-&gt;pending, kvmsg);
+        }
+    }
+    return 0;
+}
+
+//  We purge ephemeral values using exactly the same code as in
+//  the previous clonesrv5 example.
+...
+</pre></div></div><br class="example-break" /><p>We send a HUGZ message once a second to all subscribers so that they can detect if our server dies. They'll then switch over to the backup server, which will become active: 
+</p><div class="example"><a id="clonesrv6-c-5"></a><p class="title"><strong>Example 5.56. Clone server, Model Six (clonesrv6.c) - heartbeating</strong></p><div class="example-contents"><pre class="programlisting">
+
+static int
+s_send_hugz (zloop_t *loop, zmq_pollitem_t *poller, void *args)
+{
+    clonesrv_t *self = (clonesrv_t *) args;
+
+    kvmsg_t *kvmsg = kvmsg_new (self-&gt;sequence);
+    kvmsg_set_key  (kvmsg, "HUGZ");
+    kvmsg_set_body (kvmsg, (byte *) "", 0);
+    kvmsg_send     (kvmsg, self-&gt;publisher);
+    kvmsg_destroy (&amp;kvmsg);
+
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>When we switch from passive to active, we apply our pending list so that our kvmap is up-to-date. When we switch to passive, we wipe our kvmap and grab a new snapshot from the active server: 
+</p><div class="example"><a id="clonesrv6-c-6"></a><p class="title"><strong>Example 5.57. Clone server, Model Six (clonesrv6.c) - handling state changes</strong></p><div class="example-contents"><pre class="programlisting">
+
+static int
+s_new_active (zloop_t *loop, zmq_pollitem_t *unused, void *args)
+{
+    clonesrv_t *self = (clonesrv_t *) args;
+
+    self-&gt;active = true;
+    self-&gt;passive = false;
+
+    //  Stop subscribing to updates
+    zmq_pollitem_t poller = { self-&gt;subscriber, 0, ZMQ_POLLIN };
+    zloop_poller_end (bstar_zloop (self-&gt;bstar), &amp;poller);
+
+    //  Apply pending list to own hash table
+    while (zlist_size (self-&gt;pending)) {
+        kvmsg_t *kvmsg = (kvmsg_t *) zlist_pop (self-&gt;pending);
+        kvmsg_set_sequence (kvmsg, ++self-&gt;sequence);
+        kvmsg_send (kvmsg, self-&gt;publisher);
+        kvmsg_store (&amp;kvmsg, self-&gt;kvmap);
+        zclock_log ("I: publishing pending=%d", (int) self-&gt;sequence);
+    }
+    return 0;
+}
+
+static int
+s_new_passive (zloop_t *loop, zmq_pollitem_t *unused, void *args)
+{
+    clonesrv_t *self = (clonesrv_t *) args;
+
+    zhash_destroy (&amp;self-&gt;kvmap);
+    self-&gt;active = false;
+    self-&gt;passive = true;
+
+    //  Start subscribing to updates
+    zmq_pollitem_t poller = { self-&gt;subscriber, 0, ZMQ_POLLIN };
+    zloop_poller (bstar_zloop (self-&gt;bstar), &amp;poller, s_subscriber, self);
+
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>When we get an update, we create a new kvmap if necessary, and then add our update to our kvmap. We're always passive in this case: 
+</p><div class="example"><a id="clonesrv6-c-7"></a><p class="title"><strong>Example 5.58. Clone server, Model Six (clonesrv6.c) - subscriber handler</strong></p><div class="example-contents"><pre class="programlisting">
+
+static int
+s_subscriber (zloop_t *loop, zmq_pollitem_t *poller, void *args)
+{
+    clonesrv_t *self = (clonesrv_t *) args;
+    //  Get state snapshot if necessary
+    if (self-&gt;kvmap == NULL) {
+        self-&gt;kvmap = zhash_new ();
+        void *snapshot = zsocket_new (self-&gt;ctx, ZMQ_DEALER);
+        zsocket_connect (snapshot, "tcp://localhost:%d", self-&gt;peer);
+        zclock_log ("I: asking for snapshot from: tcp://localhost:%d",
+                    self-&gt;peer);
+        zstr_sendm (snapshot, "ICANHAZ?");
+        zstr_send (snapshot, ""); // blank subtree to get all
+        while (true) {
+            kvmsg_t *kvmsg = kvmsg_recv (snapshot);
+            if (!kvmsg)
+                break;          //  Interrupted
+            if (streq (kvmsg_key (kvmsg), "KTHXBAI")) {
+                self-&gt;sequence = kvmsg_sequence (kvmsg);
+                kvmsg_destroy (&amp;kvmsg);
+                break;          //  Done
+            }
+            kvmsg_store (&amp;kvmsg, self-&gt;kvmap);
+        }
+        zclock_log ("I: received snapshot=%d", (int) self-&gt;sequence);
+        zsocket_destroy (self-&gt;ctx, snapshot);
+    }
+    //  Find and remove update off pending list
+    kvmsg_t *kvmsg = kvmsg_recv (poller-&gt;socket);
+    if (!kvmsg)
+        return 0;
+
+    if (strneq (kvmsg_key (kvmsg), "HUGZ")) {
+        if (!s_was_pending (self, kvmsg)) {
+            //  If active update came before client update, flip it
+            //  around, store active update (with sequence) on pending
+            //  list and use to clear client update when it comes later
+            zlist_append (self-&gt;pending, kvmsg_dup (kvmsg));
+        }
+        //  If update is more recent than our kvmap, apply it
+        if (kvmsg_sequence (kvmsg) &gt; self-&gt;sequence) {
+            self-&gt;sequence = kvmsg_sequence (kvmsg);
+            kvmsg_store (&amp;kvmsg, self-&gt;kvmap);
+            zclock_log ("I: received update=%d", (int) self-&gt;sequence);
+        }
+        else
+            kvmsg_destroy (&amp;kvmsg);
+    }
+    else
+        kvmsg_destroy (&amp;kvmsg);
+
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>This model is only a few hundred lines of code, but it took quite a while to get working. To be accurate, building Model Six took about a full week of "Sweet god, this is just too complex for an example" hacking. We've assembled pretty much everything and the kitchen sink into this small application. We have failover, ephemeral values, subtrees, and so on. What surprised me was that the up-front design was pretty accurate. Still the details of writing and debugging so many socket flows is quite challenging.</p><p>The reactor-based design removes a lot of the grunt work from the code, and what remains is simpler and easier to understand. We reuse the bstar reactor from Reliable Request-Reply Patterns<a class="xref" href="ch04.html" title="Chapter 4. Reliable Request-Reply Patterns">Chapter 4, <em>Reliable Request-Reply Patterns</em></a>. The whole server runs as one thread, so there's no inter-thread weirdness going on--just a structure pointer (<code class="literal">self</code>) passed around to all handlers, which can do their thing happily. One nice side effect of using reactors is that the code, being less tightly integrated into a poll loop, is much easier to reuse. Large chunks of Model Six are taken from Model Five.</p><p>I built it piece by piece, and got each piece working <span class="emphasis"><em>properly</em></span> before going onto the next one. Because there are four or five main socket flows, that meant quite a lot of debugging and testing. I debugged just by dumping messages to the console. Don't use classic debuggers to step through ØMQ applications; you need to see the message flows to make any sense of what is going on.</p><p>For testing, I always try to use Valgrind, which catches memory leaks and invalid memory accesses. In C, this is a major concern, as you can't delegate to a garbage collector. Using proper and consistent abstractions like kvmsg and CZMQ helps enormously.</p></div><div class="sect2" title="The Clustered Hashmap Protocol"><div class="titlepage"><div><div><h3 class="title"><a id="idp20450736"></a>The Clustered Hashmap Protocol</h3></div></div></div><p>While the server is pretty much a mashup of the previous model plus the Binary Star pattern, the client is quite a lot more complex. But before we get to that, let's look at the final protocol. I've written this up as a specification on the ZeroMQ RFC website as the <a class="ulink" href="http://rfc.zeromq.org/spec:12" target="_top">Clustered Hashmap Protocol</a>.</p><p>Roughly, there are two ways to design a complex protocol such as this one. One way is to separate each flow into its own set of sockets. This is the approach we used here. The advantage is that each flow is simple and clean. The disadvantage is that managing multiple socket flows at once can be quite complex. Using a reactor makes it simpler, but still, it makes a lot of moving pieces that have to fit together correctly.</p><p>The second way to make such a protocol is to use a single socket pair for everything. In this case, I'd have used ROUTER for the server and DEALER for the clients, and then done everything over that connection. It makes for a more complex protocol but at least the complexity is all in one place. In Advanced Architecture using ØMQ<a class="xref" href="ch07.html" title="Chapter 7. Advanced Architecture using ØMQ">Chapter 7, <em>Advanced Architecture using ØMQ</em></a> we'll look at an example of a protocol done over a ROUTER-DEALER combination.</p><p>Let's take a look at the CHP specification. Note that "SHOULD", "MUST" and "MAY" are key words we use in protocol specifications to indicate requirement levels.</p><p><span class="bold"><strong>Goals</strong></span></p><p>CHP is meant to provide a basis for reliable pub-sub across a cluster of clients connected over a ØMQ network. It defines a "hashmap" abstraction consisting of key-value pairs. Any client can modify any key-value pair at any time, and changes are propagated to all clients. A client can join the network at any time.</p><p><span class="bold"><strong>Architecture</strong></span></p><p>CHP connects a set of client applications and a set of servers. Clients connect to the server. Clients do not see each other. Clients can come and go arbitrarily.</p><p><span class="bold"><strong>Ports and Connections</strong></span></p><p>The server MUST open three ports as follows:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>A SNAPSHOT port (ØMQ ROUTER socket) at port number P.</p></li><li class="listitem"><p>A PUBLISHER port (ØMQ PUB socket) at port number P + 1.</p></li><li class="listitem"><p>A COLLECTOR port (ØMQ SUB socket) at port number P + 2.</p></li></ul></div><p>The client SHOULD open at least two connections:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>A SNAPSHOT connection (ØMQ DEALER socket) to port number P.</p></li><li class="listitem"><p>A SUBSCRIBER connection (ØMQ SUB socket) to port number P + 1.</p></li></ul></div><p>The client MAY open a third connection, if it wants to update the hashmap:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>A PUBLISHER connection (ØMQ PUB socket) to port number P + 2.</p></li></ul></div><p>This extra frame is not shown in the commands explained below.</p><p><span class="bold"><strong>State Synchronization</strong></span></p><p>The client MUST start by sending a ICANHAZ command to its snapshot connection. This command consists of two frames as follows:</p><pre class="screen">ICANHAZ command
+-----------------------------------
+Frame 0: "ICANHAZ?"
+Frame 1: subtree specification
+</pre><p>Both frames are ØMQ strings. The subtree specification MAY be empty. If not empty, it consists of a slash followed by one or more path segments, ending in a slash.</p><p>The server MUST respond to a ICANHAZ command by sending zero or more KVSYNC commands to its snapshot port, followed with a KTHXBAI command. The server MUST prefix each command with the identity of the client, as provided by ØMQ with the ICANHAZ command. The KVSYNC command specifies a single key-value pair as follows:</p><pre class="screen">KVSYNC command
+-----------------------------------
+Frame 0: key, as 0MQ string
+Frame 1: sequence number, 8 bytes in network order
+Frame 2: &lt;empty&gt;
+Frame 3: &lt;empty&gt;
+Frame 4: value, as blob
+</pre><p>The sequence number has no significance and may be zero.</p><p>The KTHXBAI command takes this form:</p><pre class="screen">KTHXBAI command
+-----------------------------------
+Frame 0: "KTHXBAI"
+Frame 1: sequence number, 8 bytes in network order
+Frame 2: &lt;empty&gt;
+Frame 3: &lt;empty&gt;
+Frame 4: subtree specification
+</pre><p>The sequence number MUST be the highest sequence number of the KVSYNC commands previously sent.</p><p>When the client has received a KTHXBAI command, it SHOULD start to receive messages from its subscriber connection and apply them.</p><p><span class="bold"><strong>Server-to-Client Updates</strong></span></p><p>When the server has an update for its hashmap it MUST broadcast this on its publisher socket as a KVPUB command. The KVPUB command has this form:</p><pre class="screen">KVPUB command
+-----------------------------------
+Frame 0: key, as 0MQ string
+Frame 1: sequence number, 8 bytes in network order
+Frame 2: UUID, 16 bytes
+Frame 3: properties, as 0MQ string
+Frame 4: value, as blob
+</pre><p>The sequence number MUST be strictly incremental. The client MUST discard any KVPUB commands whose sequence numbers are not strictly greater than the last KTHXBAI or KVPUB command received.</p><p>The UUID is optional and frame 2 MAY be empty (size zero). The properties field is formatted as zero or more instances of "name=value" followed by a newline character. If the key-value pair has no properties, the properties field is empty.</p><p>If the value is empty, the client SHOULD delete its key-value entry with the specified key.</p><p>In the absence of other updates the server SHOULD send a HUGZ command at regular intervals, e.g., once per second. The HUGZ command has this format:</p><pre class="screen">HUGZ command
+-----------------------------------
+Frame 0: "HUGZ"
+Frame 1: 00000000
+Frame 2: &lt;empty&gt;
+Frame 3: &lt;empty&gt;
+Frame 4: &lt;empty&gt;
+</pre><p>The client MAY treat the absence of HUGZ as an indicator that the server has crashed (see Reliability below).</p><p><span class="bold"><strong>Client-to-Server Updates</strong></span></p><p>When the client has an update for its hashmap, it MAY send this to the server via its publisher connection as a KVSET command. The KVSET command has this form:</p><pre class="screen">KVSET command
+-----------------------------------
+Frame 0: key, as 0MQ string
+Frame 1: sequence number, 8 bytes in network order
+Frame 2: UUID, 16 bytes
+Frame 3: properties, as 0MQ string
+Frame 4: value, as blob
+</pre><p>The sequence number has no significance and may be zero. The UUID SHOULD be a universally unique identifier, if a reliable server architecture is used.</p><p>If the value is empty, the server MUST delete its key-value entry with the specified key.</p><p>The server SHOULD accept the following properties:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p><code class="literal">ttl</code>: specifies a time-to-live in seconds. If the KVSET command has a <code class="literal">ttl</code> property, the server SHOULD delete the key-value pair and broadcast a KVPUB with an empty value in order to delete this from all clients when the TTL has expired.</p></li></ul></div><p><span class="bold"><strong>Reliability</strong></span></p><p>CHP may be used in a dual-server configuration where a backup server takes over if the primary server fails. CHP does not specify the mechanisms used for this failover but the Binary Star pattern may be helpful.</p><p>To assist server reliability, the client MAY:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Set a UUID in every KVSET command.</p></li><li class="listitem"><p>Detect the lack of HUGZ over a time period and use this as an indicator that the current server has failed.</p></li><li class="listitem"><p>Connect to a backup server and re-request a state synchronization.</p></li></ul></div><p><span class="bold"><strong>Scalability and Performance</strong></span></p><p>CHP is designed to be scalable to large numbers (thousands) of clients, limited only by system resources on the broker. Because all updates pass through a single server, the overall throughput will be limited to some millions of updates per second at peak, and probably less.</p><p><span class="bold"><strong>Security</strong></span></p><p>CHP does not implement any authentication, access control, or encryption mechanisms and should not be used in any deployment where these are required.</p></div><div class="sect2" title="Building a Multithreaded Stack and API"><div class="titlepage"><div><div><h3 class="title"><a id="idp20474528"></a>Building a Multithreaded Stack and API</h3></div></div></div><p>The client stack we've used so far isn't smart enough to handle this protocol properly. As soon as we start doing heartbeats, we need a client stack that can run in a background thread. In the Freelance pattern at the end of Reliable Request-Reply Patterns<a class="xref" href="ch04.html" title="Chapter 4. Reliable Request-Reply Patterns">Chapter 4, <em>Reliable Request-Reply Patterns</em></a> we used a multithreaded API but didn't explain it in detail. It turns out that multithreaded APIs are quite useful when you start to make more complex ØMQ protocols like CHP.</p><div class="figure"><a id="figure-63"></a><p class="title"><strong>Figure 5.8. Multithreaded API</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig63.png" alt="Multithreaded API" /></div></div></div><br class="figure-break" /><p>If you make a nontrivial protocol and you expect applications to implement it properly, most developers will get it wrong most of the time. You're going to be left with a lot of unhappy people complaining that your protocol is too complex, too fragile, and too hard to use. Whereas if you give them a simple API to call, you have some chance of them buying in.</p><p>Our multithreaded API consists of a frontend object and a background agent, connected by two PAIR sockets<a class="xref" href="ch07s05.html#figure-64" title="Figure 7.1. The Start State">Figure 7.1, “The Start State”</a>. Connecting two PAIR sockets like this is so useful that your high-level binding should probably do what CZMQ does, which is package a "create new thread with a pipe that I can use to send messages to it" method.</p><p>The multithreaded APIs that we see in this book all take the same form:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The constructor for the object (<code class="literal">clone_new</code>) creates a context and starts a background thread connected with a pipe. It holds onto one end of the pipe so it can send commands to the background thread.</p></li><li class="listitem"><p>The background thread starts an <span class="emphasis"><em>agent</em></span> that is essentially a <code class="literal">zmq_poll</code> loop reading from the pipe socket and any other sockets (here, the DEALER and SUB sockets).</p></li><li class="listitem"><p>The main application thread and the background thread now communicate only via ØMQ messages. By convention, the frontend sends string commands so that each method on the class turns into a message sent to the backend agent, like this:</p></li></ul></div><pre class="programlisting">
+void
+clone_connect (clone_t *self, char *address, char *service)
+{
+    assert (self);
+    zmsg_t *msg = zmsg_new ();
+    zmsg_addstr (msg, "CONNECT");
+    zmsg_addstr (msg, address);
+    zmsg_addstr (msg, service);
+    zmsg_send (&amp;msg, self-&gt;pipe);
+}
+</pre><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>If the method needs a return code, it can wait for a reply message from the agent.</p></li><li class="listitem"><p>If the agent needs to send asynchronous events back to the frontend, we add a <code class="literal">recv</code> method to the class, which waits for messages on the frontend pipe.</p></li><li class="listitem"><p>We may want to expose the frontend pipe socket handle to allow the class to be integrated into further poll loops. Otherwise any <code class="literal">recv</code> method would block the application.</p></li></ul></div><p>The clone class has the same structure as the <code class="literal">flcliapi</code> class from Reliable Request-Reply Patterns<a class="xref" href="ch04.html" title="Chapter 4. Reliable Request-Reply Patterns">Chapter 4, <em>Reliable Request-Reply Patterns</em></a> and adds the logic from the last model of the Clone client. Without ØMQ, this kind of multithreaded API design would be weeks of really hard work. With ØMQ, it was a day or two of work.</p><p>The actual API methods for the clone class are quite simple:</p><pre class="programlisting">
+//  Create a new clone class instance
+clone_t *
+    clone_new (void);
+
+//  Destroy a clone class instance
+void
+    clone_destroy (clone_t **self_p);
+
+//  Define the subtree, if any, for this clone class
+void
+    clone_subtree (clone_t *self, char *subtree);
+
+//  Connect the clone class to one server
+void
+    clone_connect (clone_t *self, char *address, char *service);
+
+//  Set a value in the shared hashmap
+void
+    clone_set (clone_t *self, char *key, char *value, int ttl);
+
+//  Get a value from the shared hashmap
+char *
+    clone_get (clone_t *self, char *key);
+</pre><p>So here is Model Six of the clone client, which has now become just a thin shell using the clone class:</p><div class="example"><a id="clonecli6-c"></a><p class="title"><strong>Example 5.59. Clone client, Model Six (clonecli6.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Clone client Model Six
+
+//  Lets us build this source without creating a library
+#include "clone.c"
+#define SUBTREE "/client/"
+
+int main (void)
+{
+    //  Create distributed hash instance
+    clone_t *clone = clone_new ();
+
+    //  Specify configuration
+    clone_subtree (clone, SUBTREE);
+    clone_connect (clone, "tcp://localhost", "5556");
+    clone_connect (clone, "tcp://localhost", "5566");
+
+    //  Set random tuples into the distributed hash
+    while (!zctx_interrupted) {
+        //  Set random value, check it was stored
+        char key [255];
+        char value [10];
+        sprintf (key, "%s%d", SUBTREE, randof (10000));
+        sprintf (value, "%d", randof (1000000));
+        clone_set (clone, key, value, randof (30));
+        sleep (1);
+    }
+    clone_destroy (&amp;clone);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>Note the connect method, which specifies one server endpoint. Under the hood, we're in fact talking to three ports. However, as the CHP protocol says, the three ports are on consecutive port numbers:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The server state router (ROUTER) is at port P.</p></li><li class="listitem"><p>The server updates publisher (PUB) is at port P + 1.</p></li><li class="listitem"><p>The server updates subscriber (SUB) is at port P + 2.</p></li></ul></div><p>So we can fold the three connections into one logical operation (which we implement as three separate ØMQ connect calls).</p><p>Let's end with the source code for the clone stack. This is a complex piece of code, but easier to understand when you break it into the frontend object class and the backend agent. The frontend sends string commands ("SUBTREE", "CONNECT", "SET", "GET") to the agent, which handles these commands as well as talking to the server(s). Here is the agent's logic:</p><div class="orderedlist"><ol class="orderedlist" type="1"><li class="listitem"><p>Start up by getting a snapshot from the first server</p></li><li class="listitem"><p>When we get a snapshot switch to reading from the subscriber socket.</p></li><li class="listitem"><p>If we don't get a snapshot then fail over to the second server.</p></li><li class="listitem"><p>Poll on the pipe and the subscriber socket.</p></li><li class="listitem"><p>If we got input on the pipe, handle the control message from the frontend object.</p></li><li class="listitem"><p>If we got input on the subscriber, store or apply the update.</p></li><li class="listitem"><p>If we didn't get anything from the server within a certain time, fail over.</p></li><li class="listitem"><p>Repeat until the process is interrupted by Ctrl-C.</p></li></ol></div><p>And here is the actual clone class implementation:</p><div class="example"><a id="clone-c"></a><p class="title"><strong>Example 5.60. Clone class (clone.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  clone class - Clone client API stack (multithreaded)
+
+#include "clone.h"
+//  If no server replies within this time, abandon request
+#define GLOBAL_TIMEOUT  4000    //  msecs
+
+//  =====================================================================
+//  Synchronous part, works in our application thread
+
+//  Structure of our class
+
+struct _clone_t {
+    zctx_t *ctx;                //  Our context wrapper
+    void *pipe;                 //  Pipe through to clone agent
+};
+
+//  This is the thread that handles our real clone class
+static void clone_agent (void *args, zctx_t *ctx, void *pipe);
+</pre></div></div><br class="example-break" /><p>Here are the constructor and destructor for the clone class. Note that we create a context specifically for the pipe that connects our frontend to the backend agent: 
+</p><div class="example"><a id="clone-c-1"></a><p class="title"><strong>Example 5.61. Clone class (clone.c) - constructor and destructor</strong></p><div class="example-contents"><pre class="programlisting">
+
+clone_t *
+clone_new (void)
+{
+    clone_t
+        *self;
+
+    self = (clone_t *) zmalloc (sizeof (clone_t));
+    self-&gt;ctx = zctx_new ();
+    self-&gt;pipe = zthread_fork (self-&gt;ctx, clone_agent, NULL);
+    return self;
+}
+
+void
+clone_destroy (clone_t **self_p)
+{
+    assert (self_p);
+    if (*self_p) {
+        clone_t *self = *self_p;
+        zctx_destroy (&amp;self-&gt;ctx);
+        free (self);
+        *self_p = NULL;
+    }
+}
+</pre></div></div><br class="example-break" /><p>Specify subtree for snapshot and updates, which we must do before connecting to a server as the subtree specification is sent as the first command to the server. Sends a [SUBTREE][subtree] command to the agent: 
+</p><div class="example"><a id="clone-c-2"></a><p class="title"><strong>Example 5.62. Clone class (clone.c) - subtree method</strong></p><div class="example-contents"><pre class="programlisting">
+
+void clone_subtree (clone_t *self, char *subtree)
+{
+    assert (self);
+    zmsg_t *msg = zmsg_new ();
+    zmsg_addstr (msg, "SUBTREE");
+    zmsg_addstr (msg, subtree);
+    zmsg_send (&amp;msg, self-&gt;pipe);
+}
+</pre></div></div><br class="example-break" /><p>Connect to a new server endpoint. We can connect to at most two servers. Sends [CONNECT][endpoint][service] to the agent: 
+</p><div class="example"><a id="clone-c-3"></a><p class="title"><strong>Example 5.63. Clone class (clone.c) - connect method</strong></p><div class="example-contents"><pre class="programlisting">
+
+void
+clone_connect (clone_t *self, char *address, char *service)
+{
+    assert (self);
+    zmsg_t *msg = zmsg_new ();
+    zmsg_addstr (msg, "CONNECT");
+    zmsg_addstr (msg, address);
+    zmsg_addstr (msg, service);
+    zmsg_send (&amp;msg, self-&gt;pipe);
+}
+</pre></div></div><br class="example-break" /><p>Set a new value in the shared hashmap. Sends a [SET][key][value][ttl] command through to the agent which does the actual work: 
+</p><div class="example"><a id="clone-c-4"></a><p class="title"><strong>Example 5.64. Clone class (clone.c) - set method</strong></p><div class="example-contents"><pre class="programlisting">
+
+void
+clone_set (clone_t *self, char *key, char *value, int ttl)
+{
+    char ttlstr [10];
+    sprintf (ttlstr, "%d", ttl);
+
+    assert (self);
+    zmsg_t *msg = zmsg_new ();
+    zmsg_addstr (msg, "SET");
+    zmsg_addstr (msg, key);
+    zmsg_addstr (msg, value);
+    zmsg_addstr (msg, ttlstr);
+    zmsg_send (&amp;msg, self-&gt;pipe);
+}
+</pre></div></div><br class="example-break" /><p>Look up value in distributed hash table. Sends [GET][key] to the agent and waits for a value response. If there is no value available, will eventually return NULL: 
+</p><div class="example"><a id="clone-c-5"></a><p class="title"><strong>Example 5.65. Clone class (clone.c) - get method</strong></p><div class="example-contents"><pre class="programlisting">
+
+char *
+clone_get (clone_t *self, char *key)
+{
+    assert (self);
+    assert (key);
+    zmsg_t *msg = zmsg_new ();
+    zmsg_addstr (msg, "GET");
+    zmsg_addstr (msg, key);
+    zmsg_send (&amp;msg, self-&gt;pipe);
+
+    zmsg_t *reply = zmsg_recv (self-&gt;pipe);
+    if (reply) {
+        char *value = zmsg_popstr (reply);
+        zmsg_destroy (&amp;reply);
+        return value;
+    }
+    return NULL;
+}
+</pre></div></div><br class="example-break" /><p>The backend agent manages a set of servers, which we implement using our simple class model: 
+</p><div class="example"><a id="clone-c-6"></a><p class="title"><strong>Example 5.66. Clone class (clone.c) - working with servers</strong></p><div class="example-contents"><pre class="programlisting">
+
+typedef struct {
+    char *address;              //  Server address
+    int port;                   //  Server port
+    void *snapshot;             //  Snapshot socket
+    void *subscriber;           //  Incoming updates
+    uint64_t expiry;            //  When server expires
+    uint requests;              //  How many snapshot requests made?
+} server_t;
+
+static server_t *
+server_new (zctx_t *ctx, char *address, int port, char *subtree)
+{
+    server_t *self = (server_t *) zmalloc (sizeof (server_t));
+
+    zclock_log ("I: adding server %s:%d...", address, port);
+    self-&gt;address = strdup (address);
+    self-&gt;port = port;
+
+    self-&gt;snapshot = zsocket_new (ctx, ZMQ_DEALER);
+    zsocket_connect (self-&gt;snapshot, "%s:%d", address, port);
+    self-&gt;subscriber = zsocket_new (ctx, ZMQ_SUB);
+    zsocket_connect (self-&gt;subscriber, "%s:%d", address, port + 1);
+    zsocket_set_subscribe (self-&gt;subscriber, subtree);
+    zsocket_set_subscribe (self-&gt;subscriber, "HUGZ");
+    return self;
+}
+
+static void
+server_destroy (server_t **self_p)
+{
+    assert (self_p);
+    if (*self_p) {
+        server_t *self = *self_p;
+        free (self-&gt;address);
+        free (self);
+        *self_p = NULL;
+    }
+}
+</pre></div></div><br class="example-break" /><p>Here is the implementation of the backend agent itself: 
+</p><div class="example"><a id="clone-c-7"></a><p class="title"><strong>Example 5.67. Clone class (clone.c) - backend agent class</strong></p><div class="example-contents"><pre class="programlisting">
+
+//  Number of servers to which we will talk to
+#define SERVER_MAX      2
+
+//  Server considered dead if silent for this long
+#define SERVER_TTL      5000    //  msecs
+
+//  States we can be in
+#define STATE_INITIAL       0   //  Before asking server for state
+#define STATE_SYNCING       1   //  Getting state from server
+#define STATE_ACTIVE        2   //  Getting new updates from server
+
+typedef struct {
+    zctx_t *ctx;                //  Context wrapper
+    void *pipe;                 //  Pipe back to application
+    zhash_t *kvmap;             //  Actual key/value table
+    char *subtree;              //  Subtree specification, if any
+    server_t *server [SERVER_MAX];
+    uint nbr_servers;           //  0 to SERVER_MAX
+    uint state;                 //  Current state
+    uint cur_server;            //  If active, server 0 or 1
+    int64_t sequence;           //  Last kvmsg processed
+    void *publisher;            //  Outgoing updates
+} agent_t;
+
+static agent_t *
+agent_new (zctx_t *ctx, void *pipe)
+{
+    agent_t *self = (agent_t *) zmalloc (sizeof (agent_t));
+    self-&gt;ctx = ctx;
+    self-&gt;pipe = pipe;
+    self-&gt;kvmap = zhash_new ();
+    self-&gt;subtree = strdup ("");
+    self-&gt;state = STATE_INITIAL;
+    self-&gt;publisher = zsocket_new (self-&gt;ctx, ZMQ_PUB);
+    return self;
+}
+
+static void
+agent_destroy (agent_t **self_p)
+{
+    assert (self_p);
+    if (*self_p) {
+        agent_t *self = *self_p;
+        int server_nbr;
+        for (server_nbr = 0; server_nbr &lt; self-&gt;nbr_servers; server_nbr++)
+            server_destroy (&amp;self-&gt;server [server_nbr]);
+        zhash_destroy (&amp;self-&gt;kvmap);
+        free (self-&gt;subtree);
+        free (self);
+        *self_p = NULL;
+    }
+}
+</pre></div></div><br class="example-break" /><p>Here we handle the different control messages from the frontend; SUBTREE, CONNECT, SET, and GET: 
+</p><div class="example"><a id="clone-c-8"></a><p class="title"><strong>Example 5.68. Clone class (clone.c) - handling a control message</strong></p><div class="example-contents"><pre class="programlisting">
+
+static int
+agent_control_message (agent_t *self)
+{
+    zmsg_t *msg = zmsg_recv (self-&gt;pipe);
+    char *command = zmsg_popstr (msg);
+    if (command == NULL)
+        return -1;      //  Interrupted
+
+    if (streq (command, "SUBTREE")) {
+        free (self-&gt;subtree);
+        self-&gt;subtree = zmsg_popstr (msg);
+    }
+    else
+    if (streq (command, "CONNECT")) {
+        char *address = zmsg_popstr (msg);
+        char *service = zmsg_popstr (msg);
+        if (self-&gt;nbr_servers &lt; SERVER_MAX) {
+            self-&gt;server [self-&gt;nbr_servers++] = server_new (
+                self-&gt;ctx, address, atoi (service), self-&gt;subtree);
+            //  We broadcast updates to all known servers
+            zsocket_connect (self-&gt;publisher, "%s:%d",
+                address, atoi (service) + 2);
+        }
+        else
+            zclock_log ("E: too many servers (max. %d)", SERVER_MAX);
+        free (address);
+        free (service);
+    }
+    else
+</pre></div></div><br class="example-break" /><p>When we set a property, we push the new key-value pair onto all our connected servers: 
+</p><div class="example"><a id="clone-c-9"></a><p class="title"><strong>Example 5.69. Clone class (clone.c) - set and get commands</strong></p><div class="example-contents"><pre class="programlisting">
+        char *key = zmsg_popstr (msg);
+        char *value = zmsg_popstr (msg);
+        char *ttl = zmsg_popstr (msg);
+        zhash_update (self-&gt;kvmap, key, (byte *) value);
+        zhash_freefn (self-&gt;kvmap, key, free);
+
+        //  Send key-value pair on to server
+        kvmsg_t *kvmsg = kvmsg_new (0);
+        kvmsg_set_key  (kvmsg, key);
+        kvmsg_set_uuid (kvmsg);
+        kvmsg_fmt_body (kvmsg, "%s", value);
+        kvmsg_set_prop (kvmsg, "ttl", ttl);
+        kvmsg_send     (kvmsg, self-&gt;publisher);
+        kvmsg_destroy (&amp;kvmsg);
+        free (ttl);
+        free (key);             //  Value is owned by hash table
+    }
+    else
+    if (streq (command, "GET")) {
+        char *key = zmsg_popstr (msg);
+        char *value = zhash_lookup (self-&gt;kvmap, key);
+        if (value)
+            zstr_send (self-&gt;pipe, value);
+        else
+            zstr_send (self-&gt;pipe, "");
+        free (key);
+        free (value);
+    }
+    free (command);
+    zmsg_destroy (&amp;msg);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>The asynchronous agent manages a server pool and handles the request-reply dialog when the application asks for it: 
+</p><div class="example"><a id="clone-c-10"></a><p class="title"><strong>Example 5.70. Clone class (clone.c) - backend agent</strong></p><div class="example-contents"><pre class="programlisting">
+
+static void
+clone_agent (void *args, zctx_t *ctx, void *pipe)
+{
+    agent_t *self = agent_new (ctx, pipe);
+
+    while (true) {
+        zmq_pollitem_t poll_set [] = {
+            { pipe, 0, ZMQ_POLLIN, 0 },
+            { 0,    0, ZMQ_POLLIN, 0 }
+        };
+        int poll_timer = -1;
+        int poll_size = 2;
+        server_t *server = self-&gt;server [self-&gt;cur_server];
+        switch (self-&gt;state) {
+            case STATE_INITIAL:
+                //  In this state we ask the server for a snapshot,
+                //  if we have a server to talk to...
+                if (self-&gt;nbr_servers &gt; 0) {
+                    zclock_log ("I: waiting for server at %s:%d...",
+                        server-&gt;address, server-&gt;port);
+                    if (server-&gt;requests &lt; 2) {
+                        zstr_sendm (server-&gt;snapshot, "ICANHAZ?");
+                        zstr_send  (server-&gt;snapshot, self-&gt;subtree);
+                        server-&gt;requests++;
+                    }
+                    server-&gt;expiry = zclock_time () + SERVER_TTL;
+                    self-&gt;state = STATE_SYNCING;
+                    poll_set [1].socket = server-&gt;snapshot;
+                }
+                else
+                    poll_size = 1;
+                break;
+                
+            case STATE_SYNCING:
+                //  In this state we read from snapshot and we expect
+                //  the server to respond, else we fail over.
+                poll_set [1].socket = server-&gt;snapshot;
+                break;
+                
+            case STATE_ACTIVE:
+                //  In this state we read from subscriber and we expect
+                //  the server to give HUGZ, else we fail over.
+                poll_set [1].socket = server-&gt;subscriber;
+                break;
+        }
+        if (server) {
+            poll_timer = (server-&gt;expiry - zclock_time ())
+                       * ZMQ_POLL_MSEC;
+            if (poll_timer &lt; 0)
+                poll_timer = 0;
+        }
+</pre></div></div><br class="example-break" /><p>We're ready to process incoming messages; if nothing at all comes from our server within the timeout, that means the server is dead: 
+</p><div class="example"><a id="clone-c-11"></a><p class="title"><strong>Example 5.71. Clone class (clone.c) - client poll loop</strong></p><div class="example-contents"><pre class="programlisting">
+        int rc = zmq_poll (poll_set, poll_size, poll_timer);
+        if (rc == -1)
+            break;              //  Context has been shut down
+
+        if (poll_set [0].revents &amp; ZMQ_POLLIN) {
+            if (agent_control_message (self))
+                break;          //  Interrupted
+        }
+        else
+        if (poll_set [1].revents &amp; ZMQ_POLLIN) {
+            kvmsg_t *kvmsg = kvmsg_recv (poll_set [1].socket);
+            if (!kvmsg)
+                break;          //  Interrupted
+
+            //  Anything from server resets its expiry time
+            server-&gt;expiry = zclock_time () + SERVER_TTL;
+            if (self-&gt;state == STATE_SYNCING) {
+                //  Store in snapshot until we're finished
+                server-&gt;requests = 0;
+                if (streq (kvmsg_key (kvmsg), "KTHXBAI")) {
+                    self-&gt;sequence = kvmsg_sequence (kvmsg);
+                    self-&gt;state = STATE_ACTIVE;
+                    zclock_log ("I: received from %s:%d snapshot=%d",
+                        server-&gt;address, server-&gt;port,
+                        (int) self-&gt;sequence);
+                    kvmsg_destroy (&amp;kvmsg);
+                }
+                else
+                    kvmsg_store (&amp;kvmsg, self-&gt;kvmap);
+            }
+            else
+            if (self-&gt;state == STATE_ACTIVE) {
+                //  Discard out-of-sequence updates, incl. HUGZ
+                if (kvmsg_sequence (kvmsg) &gt; self-&gt;sequence) {
+                    self-&gt;sequence = kvmsg_sequence (kvmsg);
+                    kvmsg_store (&amp;kvmsg, self-&gt;kvmap);
+                    zclock_log ("I: received from %s:%d update=%d",
+                        server-&gt;address, server-&gt;port,
+                        (int) self-&gt;sequence);
+                }
+                else
+                    kvmsg_destroy (&amp;kvmsg);
+            }
+        }
+        else {
+            //  Server has died, failover to next
+            zclock_log ("I: server at %s:%d didn't give HUGZ",
+                    server-&gt;address, server-&gt;port);
+            self-&gt;cur_server = (self-&gt;cur_server + 1) % self-&gt;nbr_servers;
+            self-&gt;state = STATE_INITIAL;
+        }
+    }
+    agent_destroy (&amp;self);
+}
+</pre></div></div><br class="example-break" /></div></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch05s05.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch05.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch06.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">High-Speed Subscribers (Black Box Pattern) </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Chapter 6. The ØMQ Community</td></tr></table></div></body></html>

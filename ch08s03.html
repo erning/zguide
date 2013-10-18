@@ -1,0 +1,544 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Discovery</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch08.html" title="Chapter 8. A Framework for Distributed Computing" /><link rel="prev" href="ch08s02.html" title="The Secret Life of WiFi" /><link rel="next" href="ch08s04.html" title="Spinning Off a Library Project" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Discovery</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch08s02.html">Prev</a> </td><th width="60%" align="center">Chapter 8. A Framework for Distributed Computing</th><td width="20%" align="right"> <a accesskey="n" href="ch08s04.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Discovery"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp15559064"></a>Discovery</h2></div></div></div><p>Discovery is an essential part of network programming and a first-class problem for ØMQ developers. Every <code class="literal">zmq_connect ()</code> call provides an endpoint string, and that has to come from somewhere. The examples we've seen so far don't do discovery: the endpoints they connect to are hard-coded as strings in the code. While this is fine for example code, it's not ideal for real applications. Networks don't behave that nicely. Things change, and it's how well we handle change that defines our long-term success.</p><div class="sect2" title="Service Discovery"><div class="titlepage"><div><div><h3 class="title"><a id="idp15560472"></a>Service Discovery</h3></div></div></div><p>Let's start with definitions. Network discovery is finding out what other peers are on the network. Service discovery is learning what those peers can do for us. Wikipedia defines a "network service" as "a service that is hosted on a computer network", and "service" as "a set of related software functionalities that can be reused for different purposes, together with the policies that should control its usage". It's not very helpful. Is Facebook a network service?</p><p>In fact the concept of "network service" has changed over time. The number of moving pieces keeps doubling every 18-24 months, breaking old conceptual models and pushing for ever simpler, more scalable ones. A service is, for me, a system-level application that other programs can talk to. A network service is one accessible remotely (as compared to, e.g., the "grep" command, which is a command-line service).</p><p>In the classic BSD socket model, a service maps 1-to-1 to a network port. A computer system offers a number of services like "FTP", and "HTTP", each with assigned ports. The BSD API has functions like <code class="literal">getservbyname</code> to map a service name to a port number. So a classic service maps to a network endpoint: if you know a server's IP address and then you can find its FTP service, if that is running.</p><p>In modern messaging, however, services don't map 1-to-1 to endpoints. One endpoint can lead to many services, and services can move around over time, between ports, or even between systems. Where is my cloud storage today? In a realistic large distributed application, therefore, we need some kind of service discovery mechanism.</p><p>There are many ways to do this and I won't try to provide an exhaustive list. However there are a few classic patterns:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>We can force the old 1-to-1 mapping from endpoint to service, and simply state up-front that a certain TCP port number represents a certain service. Our protocol then should let us check this ("Are the first 4 bytes of the request 'HTTP'?").</p></li><li class="listitem"><p>We can bootstrap one service off another; connecting to a well-known endpoint and service, asking for the "real" service, and getting an endpoint back in return. This gives us a service lookup service. If the lookup service allows it, services can then move around as long as they update their location.</p></li><li class="listitem"><p>We can proxy one service through another, so that a well-known endpoint and service will provide other services indirectly (i.e. by forwarding messages to them). This is for instance how our Majordomo service-oriented broker works.</p></li><li class="listitem"><p>We can exchange lists of known services and endpoints, that change over time, using a gossip approach or a centralized approach (like the Clone pattern), so that each node in a distributed network can build-up an eventually consistent map of the whole network.</p></li><li class="listitem"><p>We can create further abstract layers in between network endpoints and services, e.g. assigning each node a unique identifier, so we get a "network of nodes" where each node may offer some services, and may appear on random network endpoints.</p></li><li class="listitem"><p>We can discover services opportunistically, e.g. by connecting to endpoints and then asking them what services they offer. "Hi, do you offer a shared printer? If so, what's the maker and model?"</p></li></ul></div><p>There's no "right answer". The range of options is huge, and changes over time as the scale of our networks grows. In some networks the knowledge of what services run where can literally become political power. ØMQ imposes no specific model but makes it easy to design and build the ones that suit us best. However, to build service discovery, we must start by solving network discovery.</p></div><div class="sect2" title="Network Discovery"><div class="titlepage"><div><div><h3 class="title"><a id="idp15567624"></a>Network Discovery</h3></div></div></div><p>Here is a list of the the solutions I know for network discovery:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p><span class="emphasis"><em>Use hard-coded endpoint strings</em></span>, i.e., fixed IP addresses and agreed ports. This worked in internal networks a decade ago when there were a few "big servers" and they were so important they got static IP addresses. These days however it's no use except in examples or for in-process work (threads are the new Big Iron). You can make it hurt a little less by using DNS but this is still painful for anyone who's not also doing system administration as a side-job.</p></li><li class="listitem"><p><span class="emphasis"><em>Get endpoint strings from configuration files</em></span>. This shoves name resolution into user space, which hurts less than DNS but that's like saying a punch in the face hurts less than a kick in the groin. You now get a non-trivial management problem. Who updates the configuration files, and when? Where do they live? Do we install a distributed management tool like Salt Stack?</p></li><li class="listitem"><p><span class="emphasis"><em>Use a message broker</em></span>. You still need a hard-coded or configured endpoint string to connect to the broker, but this approach reduces the number of different endpoints in the network to one. That makes a real impact, and broker-based networks do scale nicely. However, brokers are single points of failure, and they bring their own set of worries about management and performance.</p></li><li class="listitem"><p><span class="emphasis"><em>Use an addressing broker</em></span>. In other words use a central service to mediate address information (like a dynamic DNS setup) but allow nodes to send each other messages directly. It's a good model but still creates a point of failure and management costs.</p></li><li class="listitem"><p><span class="emphasis"><em>Use helper libraries, like ZeroConf</em></span>, that provide DNS services without any centralized infrastructure. It's a good answer for certain applications but your mileage will vary. Helper libraries aren't zero cost: they make it more complex to build the software, they have their own restrictions, and they aren't necessarily portable.</p></li><li class="listitem"><p><span class="emphasis"><em>Build system-level discovery</em></span> by sending out ARP or ICMP ECHO packets and then querying every node that responds. You can query through a TCP connection, for example, or by sending UDP messages. Some products do this, like the Eye-Fi wireless card.</p></li><li class="listitem"><p><span class="emphasis"><em>Do user-level brute-force discovery</em></span> by trying to connect to every single address in the network segment. You can do this trivially in ØMQ since it handles connections in the background. You don't even need multiple threads. It's brutal but fun, and works very well in demos and workshops. However it doesn't scale, and annoys decent-thinking engineers.</p></li><li class="listitem"><p><span class="emphasis"><em>Roll your own UDP-based discovery protocol</em></span>. Lots of people do this (I counted about 80 questions on this topic on StackOverflow). UDP works well for this and it's technically clear. But it's technically tricky to get right, to the point where any developer doing this the first few times will get it dramatically wrong.</p></li><li class="listitem"><p><span class="emphasis"><em>Gossip discovery protocols</em></span>. A fully-interconnected network is quite effective for smaller numbers of nodes (say, up to 100 or 200). For large numbers of nodes, we need some kind of gossip protocol. That is, where the nodes we can reasonable discover (say, on the same segment as us), tell us about nodes that are further away. Gossip protocols go beyond what we need these days with ØMQ, but will likely be more common in the future. One example of a wide-area gossip model is mesh networking.</p></li></ul></div></div><div class="sect2" title="The Use Case"><div class="titlepage"><div><div><h3 class="title"><a id="idp21199400"></a>The Use Case</h3></div></div></div><p>Let's define our use case more explicitly. After all, all these different approaches have worked and still work to some extent. What interests me as architect is the future, and finding designs that can continue to work for more than a few years. This means identifying long term trends. Our use case isn't here and now, it's ten or twenty years from today.</p><p>Here are the long term trends I see in distributed applications:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p><span class="emphasis"><em>The overall number of moving pieces keeps increasing</em></span>. My estimate is that it doubles every 24 months, but how fast it increases matters less than the fact that we keep adding more and more nodes to our networks. They're not just boxes but also processes and threads. The driver here is cost, <a class="ulink" href="http://softwareandsilicon.com/" target="_top">which keeps falling</a>. In a decade, the average teenager will carry 30-50 devices, all the time.</p></li><li class="listitem"><p><span class="emphasis"><em>Control shifts away from the center</em></span>. Possibly data too, though we're still far from understanding how to build simple decentralized information stores. In any case, the star topology is slowly dying and being replaced by clouds of clouds. In the future there's going to be much more traffic within a local environment (home, office, school, bar) than between remote nodes and the center. The maths here are simple: remote communications cost more, run more slowly and are less natural than close-range communications. It's more accurate both technically and socially to share a holiday video with your friend over local WiFi than via Facebook.</p></li><li class="listitem"><p><span class="emphasis"><em>Networks are increasingly collaborative, less controlled</em></span>. This means people bringing their own devices and expecting them to work seamlessly. The Web showed one way to make this work but we're reaching the limits of what the Web can do, as we start to exceed the average of one device per person.</p></li><li class="listitem"><p><span class="emphasis"><em>The cost of connecting a new node to a network must fall proportionally</em></span>, if the network is to scale. This means reducing the amount of configuration a node needs: less pre-shared state, less context. Again, the Web solved this problem but at the cost of centralization. We want the same plug and play experience but without a central agency.</p></li></ul></div><p>In a world of trillions of nodes, the ones you talk to most are the ones closest to you. This is how it works in the real world and it's the sanest way of scaling large-scale architectures. Groups of nodes, logically or physically close, connected by bridges to other groups of nodes. A local group will be anything from half-a-dozen nodes to a few thousand nodes.</p><p>So we have two basic use cases:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p><span class="bold"><strong>Discovery for proximity networks</strong></span>, that is, a set of nodes that find themselves close to each other. We can define "close to each other" as being "on the same network segment". It's not going to be true in all cases but it's true enough to be a useful place to start.</p></li><li class="listitem"><p><span class="bold"><strong>Discovery across wide area networks</strong></span>, that is, bridging of proximity networks together. We sometimes call this "federation". There are many ways to do federation but it's complex and something to cover elsewhere. For now, let's assume we do federation using a centralized broker or service.</p></li></ul></div><p>So we are left with the problem of proximity networking. I want to just plug things into the network and have them talking to each other. Whether they're tablets in a school or a bunch of servers in a cloud, the less upfront agreement and coordination, the cheaper it is to scale. So configuration files and brokers and any kind of centralized service are all out.</p><p>I also want to allow any number of applications on a box, both because that's how the real world works (people download apps), and so that I can simulate large networks on my laptop. Upfront simulation is the only way I know to be sure a system will work when it's loaded in real-life. You'd be surprised how engineers just hope things will work. "Oh, I'm sure that bridge will stay up when we open it to traffic". If you haven't simulated and fixed the three most likely failures, they'll still be there on opening day.</p><p>Running multiple instances of a service on the same machine - without upfront coordination - means we have to use ephemeral ports, i.e., ports assigned randomly for services. Ephemeral ports rule out brute-force TCP discovery and any DNS solution including ZeroConf.</p><p>Finally, discovery has to happen in user space because the apps we're building will be running on random boxes that we do not necessarily own and control. For example, other people's mobile devices. So any discovery that needs root permissions is excluded. This rules out ARP and ICMP and once again ZeroConf since that also needs root permissions for the service parts.</p></div><div class="sect2" title="Technical Requirements"><div class="titlepage"><div><div><h3 class="title"><a id="idp21209824"></a>Technical Requirements</h3></div></div></div><p>Let's recap the requirements:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p><span class="emphasis"><em>The simplest possible solution that works</em></span>. There are so many edge cases in ad-hoc networks that every extra feature or functionality becomes a risk.</p></li><li class="listitem"><p><span class="emphasis"><em>Supports ephemeral ports</em></span>, so that we can run realistic simulations. If the only way to test is to use real devices, it becomes impossibly expensive and slow to run tests.</p></li><li class="listitem"><p><span class="emphasis"><em>No root access needed</em></span>, it must run 100% in user space. We want to ship fully-packaged applications onto devices like mobile phones that we don't own and where root access isn't available.</p></li><li class="listitem"><p><span class="emphasis"><em>Invisible to system administrators</em></span>, so we do not need their help to run our applications. Whatever technique we use should be friendly to the network and available by default.</p></li><li class="listitem"><p><span class="emphasis"><em>Zero configuration</em></span> apart from installing the applications themselves. Asking the users to do any configuration is giving them an excuse to not use the applications.</p></li><li class="listitem"><p><span class="emphasis"><em>Fully portable</em></span> to all modern operating systems. We can't assume we'll be running on any specific OS. We can't assume any support from the operating system except standard user-space networking. We can assume ØMQ and CZMQ are available.</p></li><li class="listitem"><p><span class="emphasis"><em>Friendly to WiFi networks</em></span> with up to 100-150 participants. This means keeping messages small and being aware of how WiFi networks scale and how they break under pressure.</p></li><li class="listitem"><p><span class="emphasis"><em>Protocol-neutral</em></span>, i.e., our beaconing should not impose any specific discovery protocol. I'll explain what this means a little later.</p></li><li class="listitem"><p><span class="emphasis"><em>Easy to re-implement in any given language</em></span>. Sure, we have a nice C implementation, but if it takes too long to re-implement in another language, that excludes large chunks of the ØMQ community. So, again, simple.</p></li><li class="listitem"><p><span class="emphasis"><em>Fast response time</em></span>. By this, I mean a new node should be visible to its peers in a very short time, a second or two at most. Networks change shape rapidly. It's OK to take longer, even 30 seconds, to realize a peer has disappeared.</p></li></ul></div><p>From the list of possible solutions I collected, the only option that isn't disqualified for one or more reasons is to build our own UDP-based discovery stack. It's a little disappointing that after so many decades of research into network discovery, this is where we end up. But the history of computing does seem to go from complex to simple, so maybe it's normal.</p></div><div class="sect2" title="A Self-Healing P2P Network in 30 Seconds"><div class="titlepage"><div><div><h3 class="title"><a id="idp21216856"></a>A Self-Healing P2P Network in 30 Seconds</h3></div></div></div><p>I mentioned brute-force discovery. Let's see how that works. One nice thing about software is to brute-force your way through the learning experience. As long as we're happy to throw away work, we can learn rapidly simply by trying things that may seem insane from the safety of the armchair.</p><p>I'll explain a brute-force discovery approach for ØMQ that emerged from a workshop in 2012. It is remarkably simple and stupid: connect to every IP address in the room. If your network segment is 192.168.55.x, for instance, you do this:</p><pre class="screen">connect to tcp://192.168.55.1:9000
+connect to tcp://192.168.55.2:9000
+connect to tcp://192.168.55.3:9000
+...
+connect to tcp://192.168.55.254:9000
+</pre><p>Which in ØMQ-speak looks like this:</p><pre class="programlisting">
+int address;
+for (address = 1; address &lt; 255; address++)
+    zsocket_connect (listener, "tcp://192.168.55.%d:9000", address);
+</pre><p>The stupid part is where we assume that connecting to ourselves is fine, where we assume that all peers are on the same network segment, where we waste file handles as if they were free. Luckily these assumptions are often totally accurate. At least, often enough to let us do fun things.</p><p>The loop works because ØMQ connect calls are <span class="emphasis"><em>asynchronous and opportunistic</em></span>. They lie in the shadows like hungry cats, waiting patiently to pounce on any innocent mouse that dared start up a service on port 9000. It's simple, effective, and worked first time.</p><p>It gets better: as peers leave and join the network, they'll automatically reconnect. We've designed a self-healing peer to peer network, in 30 seconds and three lines of code.</p><p>It won't work for real cases though. Poorer operating systems tend to run out of file handles, and networks tend to be more complex than one segment. And if one node squats a couple of hundred file handles, large-scale simulations (with many nodes on one box or in one process) are out of the question.</p><p>Still, let's see how far we can go with this approach before we throw it out. Here's a tiny decentralized chat program that lets you talk to anyone else on the same network segment. The code has two threads: a listener and a broadcaster. The listener creates a SUB socket and does the brute-force connection to all peers in the network. The broadcaster accepts input from the console and sends it on a PUB socket:</p><div class="example"><a id="dechat-c"></a><p class="title"><strong>Example 8.1. Decentralized Chat (dechat.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Decentralized chat example
+//
+#include &lt;czmq.h&gt;
+
+static void
+listener_task (void *args, zctx_t *ctx, void *pipe)
+{
+    void *listener = zsocket_new (ctx, ZMQ_SUB);
+    int address;
+    for (address = 1; address &lt; 255; address++) {
+        int rc = zsocket_connect (listener,
+            "tcp://%s%d:9000", (char *) args, address);
+        assert (rc == 0);
+    }
+    zsocket_set_subscribe (listener, "");
+    while (!zctx_interrupted) {
+        char *message = zstr_recv (listener);
+        if (message) {
+            printf ("%s", message);
+            free (message);
+        }
+    }
+}
+
+int main (int argc, char *argv [])
+{
+    char *dot = argc == 4? strrchr (argv [1], '.'): NULL;
+    if (dot)
+        dot [1] = 0;        //  Cut string after dot
+    else {
+        puts ("Usage: dechat ipaddress interface username");
+        puts ("Example: dechat 192.168.55.123 eth0 joe");
+        exit (0);
+    }
+    zctx_t *ctx = zctx_new ();
+    zthread_fork (ctx, listener_task, argv [1]);
+
+    void *broadcaster = zsocket_new (ctx, ZMQ_PUB);
+    zsocket_bind (broadcaster, "tcp://%s:9000", argv [2]);
+    while (!zctx_interrupted) {
+        char message [1024];
+        if (!fgets (message, 1024, stdin))
+            break;
+        zstr_send (broadcaster, "%s: %s", argv [3], message);
+    }
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>The <code class="literal">dechat</code> program needs to know the current IP address, the interface, and an alias. We could get these in code from the operating system, but that's grunky non-portable code. So we provide this information on the command line:</p><pre class="screen">dechat 192.168.55.122 eth0 Joe
+</pre></div><div class="sect2" title="Preemptive Discovery over Raw Sockets"><div class="titlepage"><div><div><h3 class="title"><a id="idp21226160"></a>Preemptive Discovery over Raw Sockets</h3></div></div></div><p>One of the great things about short-range wireless is the proximity. WiFi maps closely to the physical space, which maps closely to how we naturally organize. In fact, the Internet is quite abstract and this confuses a lot of people who kind of "get it" but in fact don't really. With WiFi, we have technical connectivity that is potentially super-tangible. You see what you get and you get what you see. Tangible means easy to understand and that should mean love from users instead of the typical frustration and seething hatred.</p><p>Proximity is the key. We have a bunch of WiFi radios in a room, happily beaconing to each other. For lots of applications, it makes sense that they can find each other and start chatting without any user input. After all, most real world data isn't private, it's just highly localized.</p><p>I'm in a hotel room in Gangnam, Seoul, with a 4G wireless hotspot, a Linux laptop, and an couple of Android phones. The phones and laptop are talking to the hotspot. The <code class="literal">ifconfig</code> command says my IP address is 192.168.1.2. Let me try some <code class="literal">ping</code> commands. DHCP servers tend to dish out addresses in sequence, so my phones are probably close by, numerically speaking:</p><pre class="screen">$ ping 192.168.1.1
+PING 192.168.1.1 (192.168.1.1) 56(84) bytes of data.
+64 bytes from 192.168.1.1: icmp_req=1 ttl=64 time=376 ms
+64 bytes from 192.168.1.1: icmp_req=2 ttl=64 time=358 ms
+64 bytes from 192.168.1.1: icmp_req=4 ttl=64 time=167 ms
+^C
+--- 192.168.1.1 ping statistics ---
+3 packets transmitted, 2 received, 33% packet loss, time 2001ms
+rtt min/avg/max/mdev = 358.077/367.522/376.967/9.445 ms
+</pre><p>Found one! 150-300 msec round-trip latency... that's a surprisingly high figure, something to keep in mind for later. Now I ping myself, just to try to double-check things:</p><pre class="screen">$ ping 192.168.1.2
+PING 192.168.1.2 (192.168.1.2) 56(84) bytes of data.
+64 bytes from 192.168.1.2: icmp_req=1 ttl=64 time=0.054 ms
+64 bytes from 192.168.1.2: icmp_req=2 ttl=64 time=0.055 ms
+64 bytes from 192.168.1.2: icmp_req=3 ttl=64 time=0.061 ms
+^C
+--- 192.168.1.2 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 1998ms
+rtt min/avg/max/mdev = 0.054/0.056/0.061/0.009 ms
+</pre><p>The response time is a bit faster now, which is what we'd expect. Let's try the next couple of addresses:</p><pre class="screen">$ ping 192.168.1.3
+PING 192.168.1.3 (192.168.1.3) 56(84) bytes of data.
+64 bytes from 192.168.1.3: icmp_req=1 ttl=64 time=291 ms
+64 bytes from 192.168.1.3: icmp_req=2 ttl=64 time=271 ms
+64 bytes from 192.168.1.3: icmp_req=3 ttl=64 time=132 ms
+^C
+--- 192.168.1.3 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 2001ms
+rtt min/avg/max/mdev = 132.781/231.914/291.851/70.609 ms
+</pre><p>That's the second phone, with the same kind of latency as the first one. Let's continue and see if there are any other devices connected to the hotspot:</p><pre class="screen">$ ping 192.168.1.4
+PING 192.168.1.4 (192.168.1.4) 56(84) bytes of data.
+^C
+--- 192.168.1.4 ping statistics ---
+3 packets transmitted, 0 received, 100% packet loss, time 2016ms
+</pre><p>And that is it. Now, <code class="literal">ping</code> uses raw IP sockets to send <code class="literal">ICMP_ECHO</code> messages. The useful thing about <code class="literal">ICMP_ECHO</code> is that it gets a response from any IP stack that has not deliberately had echo switched off. That's still a common practice on corporate websites who fear the old "ping of death" exploit where malformed messages could crash the machine.</p><p>I call this <span class="emphasis"><em>preemptive discovery</em></span> because it doesn't take any cooperation from the device. We don't rely on any cooperation from the phones to see them sitting there; as long as they're not actively ignoring us, we can see them.</p><p>You might ask why this is useful. We don't know that the peers responding to <code class="literal">ICMP_ECHO</code> run ØMQ, that they are interested in talking to us, that they have any services we can use, or even what kind of device they are. However, knowing that there's <span class="emphasis"><em>something</em></span> on address 192.168.1.3 is already useful. We also know how far away the device is, relatively, we know how many devices are on the network, and we know the rough state of the network (as in, good, poor, or terrible).</p><p>It isn't even hard to create <code class="literal">ICMP_ECHO</code> messages and send them. A few dozen lines of code, and we could use ØMQ multithreading to do this in parallel for addresses stretching out above and below our own IP address. Could be kind of fun.</p><p>However, sadly, there's a fatal flaw in my idea of using <code class="literal">ICMP_ECHO</code> to discover devices. To open a raw IP socket requires root privileges on a POSIX box. It stops rogue programs getting data meant for others. We can get the power to open raw sockets on Linux by giving sudo privileges to our command (ping has the so-called <span class="emphasis"><em>sticky bit</em></span> set). On a mobile OS like Android, it requires root access, i.e., rooting the phone or tablet. That's out of the question for most people and so <code class="literal">ICMP_ECHO</code> is out of reach for most devices.</p><p><span class="emphasis"><em>Expletive deleted!</em></span> Let's try something in user space. The next step most people take is UDP multicast or broadcast. Let's follow that trail.</p></div><div class="sect2" title="Cooperative Discovery Using UDP Broadcasts"><div class="titlepage"><div><div><h3 class="title"><a id="idp21238648"></a>Cooperative Discovery Using UDP Broadcasts</h3></div></div></div><p>Multicast tends to be seen as more modern and "better" than broadcast. In IPv6, broadcast doesn't work at all: you must always use multicast. Nonetheless, all IPv4 local network discovery protocols end up using UDP broadcast anyhow. The reasons: broadcast and multicast end up working much the same, except broadcast is simpler and less risky. Multicast is seen by network admins as kind of dangerous, as it can leak over network segments.</p><p>If you've never used UDP, you'll discover it's quite a nice protocol. In some ways, it reminds us of ØMQ, sending whole messages to peers using a two different patterns: one-to-one, and one-to-many. The main problems with UDP are that (a) the POSIX socket API was designed for universal flexibility, not simplicity, (b) UDP messages are limited for practical purposes to about 512 bytes, and (c) when you start to use UDP for real data, you find that a lot of messages get dropped, especially as infrastructure tends to favor TCP over UDP.</p><p>Here is a minimal ping program that uses UDP instead of <code class="literal">ICMP_ECHO</code>:</p><div class="example"><a id="udpping1-c"></a><p class="title"><strong>Example 8.2. UDP discovery, model 1 (udpping1.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  UDP ping command
+//  Model 1, does UDP work inline
+
+#include &lt;czmq.h&gt;
+#define PING_PORT_NUMBER 9999
+#define PING_MSG_SIZE    1
+#define PING_INTERVAL    1000  //  Once per second
+
+static void
+derp (char *s)
+{
+    perror (s);
+    exit (1);
+}
+
+int main (void)
+{
+    zctx_t *ctx = zctx_new ();
+
+    //  Create UDP socket
+    int fd;
+    if ((fd = socket (AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1)
+        derp ("socket");
+
+    //  Ask operating system to let us do broadcasts from socket
+    int on = 1;
+    if (setsockopt (fd, SOL_SOCKET, SO_BROADCAST, &amp;on, sizeof (on)) == -1)
+        derp ("setsockopt (SO_BROADCAST)");
+
+    //  Bind UDP socket to local port so we can receive pings
+    struct sockaddr_in si_this = { 0 };
+    si_this.sin_family = AF_INET;
+    si_this.sin_port = htons (PING_PORT_NUMBER);
+    si_this.sin_addr.s_addr = htonl (INADDR_ANY);
+    if (bind (fd, &amp;si_this, sizeof (si_this)) == -1)
+        derp ("bind");
+    
+    byte buffer [PING_MSG_SIZE];
+    
+</pre></div></div><br class="example-break" /><p>We use <code class="literal">zmq_poll</code> to wait for activity on the UDP socket, because this function works on non-ØMQ file handles. We send a beacon once a second, and we collect and report beacons that come in from other nodes: 
+</p><div class="example"><a id="udpping1-c-1"></a><p class="title"><strong>Example 8.3. UDP discovery, model 1 (udpping1.c) - main ping loop</strong></p><div class="example-contents"><pre class="programlisting">
+    zmq_pollitem_t pollitems [] = {{ NULL, fd, ZMQ_POLLIN, 0 }};
+    //  Send first ping right away
+    uint64_t ping_at = zclock_time ();
+    
+    while (!zctx_interrupted) {
+        long timeout = (long) (ping_at - zclock_time ());
+        if (timeout &lt; 0)
+            timeout = 0;
+        if (zmq_poll (pollitems, 1, timeout * ZMQ_POLL_MSEC) == -1)
+            break;              //  Interrupted
+
+        //  Someone answered our ping
+        if (pollitems [0].revents &amp; ZMQ_POLLIN) {
+            struct sockaddr_in si_that;
+            socklen_t si_len = sizeof (struct sockaddr_in);
+            ssize_t size = recvfrom (fd, buffer, PING_MSG_SIZE, 0,
+                                     &amp;si_that, &amp;si_len);
+            if (size == -1)
+                derp ("recvfrom");
+            printf ("Found peer %s:%d\n",
+                inet_ntoa (si_that.sin_addr), ntohs (si_that.sin_port));
+        }
+        if (zclock_time () &gt;= ping_at) {
+            //  Broadcast our beacon
+            puts ("Pinging peers...");
+            buffer [0] = '!';
+            struct sockaddr_in si_that = si_this;
+            inet_aton ("255.255.255.255", &amp;si_that.sin_addr);
+            if (sendto (fd, buffer, PING_MSG_SIZE, 0,
+                        &amp;si_that, sizeof (struct sockaddr_in)) == -1)
+                derp ("sendto");
+            ping_at = zclock_time () + PING_INTERVAL;
+        }
+    }
+    close (fd);
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>This code uses a single socket to broadcast 1-byte messages and receive anything that other nodes are broadcasting. When I run it, it shows just one node, which is itself:</p><pre class="screen">Pinging peers...
+Found peer 192.168.1.2:9999
+Pinging peers...
+Found peer 192.168.1.2:9999
+</pre><p>If I switch off all networking and try again, sending a message fails, as I'd expect:</p><pre class="screen">Pinging peers...
+sendto: Network is unreachable
+</pre><p>Working on the basis of <span class="emphasis"><em>solve the problems currently aiming at your throat</em></span>, let's fix the most urgent issues in this first model. These issues are:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Using the 255.255.255.255 broadcast address is a bit dubious. On the one hand, this broadcast address means precisely "send to all nodes on the local network, and don't forward". However, if you have several interfaces (wired Ethernet, WiFi) then broadcasts will go out on your default route only, and via just one interface. What we want to do is either send our broadcast on each interface's broadcast address, or find the WiFi interface and its broadcast address.</p></li><li class="listitem"><p>Like many aspects of socket programming, getting information on network interfaces is not portable. Do we want to write nonportable code in our applications? No, this is better hidden in a library.</p></li><li class="listitem"><p>There's no handling for errors except "abort", which is too brutal for transient problems like "your WiFi is switched off". The code should distinguish between soft errors (ignore and retry) and hard errors (assert).</p></li><li class="listitem"><p>The code needs to know its own IP address and ignore beacons that it sent out. Like finding the broadcast address, this requires inspecting the available interfaces.</p></li></ul></div><p>The simplest answer to these issues is to push the UDP code into a separate library that provides a clean API, like this:</p><pre class="programlisting">
+//  Constructor
+static udp_t *
+    udp_new (int port_nbr);
+
+//  Destructor
+static void
+    udp_destroy (udp_t **self_p);
+
+//  Returns UDP socket handle
+static int
+    udp_handle (udp_t *self);
+
+//  Send message using UDP broadcast
+static void
+    udp_send (udp_t *self, byte *buffer, size_t length);
+
+//  Receive message from UDP broadcast
+static ssize_t
+    udp_recv (udp_t *self, byte *buffer, size_t length);
+</pre><p>Here is the refactored UDP ping program that calls this library, which is much cleaner and nicer:</p><div class="example"><a id="udpping2-c"></a><p class="title"><strong>Example 8.4. UDP discovery, model 2 (udpping2.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  UDP ping command
+//  Model 2, uses separate UDP library
+
+#include &lt;czmq.h&gt;
+#include "udplib.c"
+#define PING_PORT_NUMBER 9999
+#define PING_MSG_SIZE    1
+#define PING_INTERVAL    1000  //  Once per second
+
+int main (void)
+{
+    zctx_t *ctx = zctx_new ();
+    udp_t *udp = udp_new (PING_PORT_NUMBER);
+    
+    byte buffer [PING_MSG_SIZE];
+    zmq_pollitem_t pollitems [] = {
+        { NULL, udp_handle (udp), ZMQ_POLLIN, 0 }
+    };
+    //  Send first ping right away
+    uint64_t ping_at = zclock_time ();
+    
+    while (!zctx_interrupted) {
+        long timeout = (long) (ping_at - zclock_time ());
+        if (timeout &lt; 0)
+            timeout = 0;
+        if (zmq_poll (pollitems, 1, timeout * ZMQ_POLL_MSEC) == -1)
+            break;              //  Interrupted
+
+        //  Someone answered our ping
+        if (pollitems [0].revents &amp; ZMQ_POLLIN)
+            udp_recv (udp, buffer, PING_MSG_SIZE);
+        
+        if (zclock_time () &gt;= ping_at) {
+            puts ("Pinging peers...");
+            buffer [0] = '!';
+            udp_send (udp, buffer, PING_MSG_SIZE);
+            ping_at = zclock_time () + PING_INTERVAL;
+        }
+    }
+    udp_destroy (&amp;udp);
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>The library, <code class="literal">udplib</code>, hides a lot of the unpleasant code (which will become uglier as we make this work on more systems). I'm not going to print that code here. You can read it <a class="ulink" href="https://github.com/imatix/zguide/blob/master/examples/C/udplib.c" target="_top">in the repository</a>.</p><p>Now, there are more problems sizing us up and wondering if they can make lunch out of us. First, IPv4 versus IPv6 and multicast versus broadcast. In IPv6, broadcast doesn't exist at all; one uses multicast. From my experience with WiFi, IPv4 multicast and broadcast work identically except that multicast breaks in some situations where broadcast works fine. Some access points do not forward multicast packets. When you have a device (e.g., a tablet) that acts as a mobile AP, then it's possible it won't get multicast packets. Meaning, it won't see other peers on the network.</p><p>The simplest plausible solution is simply to ignore IPv6 for now, and use broadcast. A perhaps smarter solution would be to use multicast and deal with asymmetric beacons if they happen.</p><p>We'll stick with stupid and simple for now. There's always time to make it more complex.</p></div><div class="sect2" title="Multiple Nodes on One Device"><div class="titlepage"><div><div><h3 class="title"><a id="idp21257040"></a>Multiple Nodes on One Device</h3></div></div></div><p>So we can discover nodes on the WiFi network, as long as they're sending out beacons as we expect. So I try to test with two processes. But when I run udpping2 twice, the second instance complains "'Address already in use' on bind" and exits. Oh, right. UDP and TCP both return an error if you try to bind two different sockets to the same port. This is right. The semantics of two readers on one socket would be weird to say the least. Odd/even bytes? You get all the 1s, I get all the 0's?</p><p>However, a quick check of stackoverflow.com and some memory of a socket option called <code class="literal">SO_REUSEADDR</code> turns up gold. If I use that, I can bind several processes to the same UDP port, and they will all receive any message arriving on that port. It's almost as if the guys who designed this were reading my mind! (That's way more plausible than the chance that I may be reinventing the wheel.)</p><p>A quick test shows that <code class="literal">SO_REUSEADDR</code> works as promised. This is great because the next thing I want to do is design an API and then start dozens of nodes to see them discovering each other. It would be really cumbersome to have to test each node on a separate device. And when we get to testing how real traffic behaves on a large, flaky network, the two alternatives are simulation or temporary insanity.</p><p>And I speak from experience: we were, this summer, testing on dozens of devices at once. It takes about an hour to set up a full test run, and you need a space shielded from WiFi interference if you want any kind of reproducibility (unless your test case is "prove that interference kills WiFi networks faster than Orval can kill a thirst".</p><p>If I were a whiz Android developer with a free weekend, I'd immediately (as in, it would take me two days) port this code to my phone and get it sending beacons to my PC. But sometimes lazy is more profitable. I <span class="emphasis"><em>like</em></span> my Linux laptop. I like being able to start a dozen threads from one process, and have each thread acting like an independent node. I like not having to work in a real Faraday cage when I can simulate one on my laptop.</p></div><div class="sect2" title="Designing the API"><div class="titlepage"><div><div><h3 class="title"><a id="idp21261416"></a>Designing the API</h3></div></div></div><p>I'm going to run N nodes on a device, and they are going to have to discover each other, as well as a bunch of other nodes out there on the local network. I can use UDP for local discovery as well as remote discovery. It's arguably not as efficient as using, e.g., the ØMQ inproc:// transport, but it has the great advantage that the exact same code will work in simulation and in real deployment.</p><p>If I have multiple nodes on one device, we clearly can't use the IP address and port number as node address. I need some logical node identifier. Arguably, the node identifier only has to be unique within the context of the device. My mind fills with complex stuff I could make, like supernodes that sit on real UDP ports and forward messages to internal nodes. I hit my head on the table until the idea of <span class="emphasis"><em>inventing new concepts</em></span> leaves it.</p><p>Experience tells us that WiFi does things like disappear and reappear while applications are running. Users click on things, which does interesting things like change the IP address halfway through a session. We cannot depend on IP addresses, nor on established connections (in the TCP fashion). We need some long-lasting addressing mechanism that survives interfaces and connections being torn down and then recreated.</p><p>Here's the simplest solution I can see: we give every node a UUID, and specify that nodes, represented by their UUIDs, can appear or reappear at certain IP address:port endpoints, and then disappear again. We'll deal with recovery from lost messages later. A UUID is 16 bytes. So if I have 100 nodes on a WiFi network, that's (double it for other random stuff) 3,200 bytes a second of beacon data that the air has to carry just for discovery and presence. Seems acceptable.</p><p>Back to concepts. We do need some names for our API. At the least we need a way to distinguish between the node object that is "us", and node objects that are our peers.  We'll be doing things like creating an "us" and then asking it how many peers it knows about and who they are. The term "peer" is clear enough.</p><p>From the developer point of view, a node (the application) needs a way to talk to the outside world. Let's borrow a term from networking and call this an "interface". The interface represents us to the rest of the world and presents the rest of the world to us, as a set of other peers. It automatically does whatever discovery it must. When we want to talk to a peer, we get the interface to do that for us. And when a peer talks to us, it's the interface that delivers us the message.</p><p>This seems like a clean API design. How about the internals?</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The interface must be multithreaded so that one thread can do I/O in the background, while the foreground API talks to the application. We used this design in the Clone and Freelance client APIs.</p></li><li class="listitem"><p>The interface background thread does the discovery business; bind to the UDP port, send out UDP beacons, and receive beacons.</p></li><li class="listitem"><p>We need to at least send UUIDs in the beacon message so that we can distinguish our own beacons from those of our peers.</p></li><li class="listitem"><p>We need to track peers that appear, and that disappear. For this, I'll use a hash table that stores all known peers and expire peers after some timeout.</p></li><li class="listitem"><p>We need a way to report peers and events to the caller. Here we get into a juicy question. How does a background I/O thread tell a foreground API thread that stuff is happening? Callbacks maybe? <span class="emphasis"><em>Heck no.</em></span> We'll use ØMQ messages, of course.</p></li></ul></div><p>The third iteration of the UDP ping program is even simpler and more beautiful than the second. The main body, in C, is just ten lines of code.</p><div class="example"><a id="udpping3-c"></a><p class="title"><strong>Example 8.5. UDP discovery, model 3 (udpping3.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  UDP ping command
+//  Model 3, uses abstract network interface
+
+#include &lt;czmq.h&gt;
+#include "interface.c"
+
+int main (void)
+{
+    interface_t *interface = interface_new ();
+    while (true) {
+        zmsg_t *msg = interface_recv (interface);
+        if (!msg)
+            break;              //  Interrupted
+        zmsg_dump (msg);
+    }
+    interface_destroy (&amp;interface);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>The interface code should be familiar if you've studied how we make multithreaded API classes:</p><div class="example"><a id="interface-c"></a><p class="title"><strong>Example 8.6. UDP ping interface (interface.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Interface class for Chapter on Distributed Computing
+//  This implements an "interface" to our network of nodes
+
+#include &lt;czmq.h&gt;
+#include &lt;uuid/uuid.h&gt;
+#include "udplib.c"
+
+//  =====================================================================
+//  Synchronous part, works in our application thread
+
+//  Structure of our class
+
+typedef struct {
+    zctx_t *ctx;                //  Our context wrapper
+    void *pipe;                 //  Pipe through to agent
+} interface_t;
+
+//  This is the thread that handles our real interface class
+static void
+    interface_agent (void *args, zctx_t *ctx, void *pipe);
+</pre></div></div><br class="example-break" /><p>Here are the constructor and destructor for the interface class. Note that the class has barely any properties; it is just an excuse to start the background thread and a wrapper around <code class="literal">zmsg_recv</code>: 
+</p><div class="example"><a id="interface-c-1"></a><p class="title"><strong>Example 8.7. UDP ping interface (interface.c) - constructor and destructor</strong></p><div class="example-contents"><pre class="programlisting">
+
+interface_t *
+interface_new (void)
+{
+    interface_t
+        *self;
+
+    self = (interface_t *) zmalloc (sizeof (interface_t));
+    self-&gt;ctx = zctx_new ();
+    self-&gt;pipe = zthread_fork (self-&gt;ctx, interface_agent, NULL);
+    return self;
+}
+
+void
+interface_destroy (interface_t **self_p)
+{
+    assert (self_p);
+    if (*self_p) {
+        interface_t *self = *self_p;
+        zctx_destroy (&amp;self-&gt;ctx);
+        free (self);
+        *self_p = NULL;
+    }
+}
+</pre></div></div><br class="example-break" /><p>Here we wait for a message from the interface. This returns us a <code class="literal">zmsg_t</code> object, or NULL if interrupted: 
+</p><div class="example"><a id="interface-c-2"></a><p class="title"><strong>Example 8.8. UDP ping interface (interface.c) - receive message</strong></p><div class="example-contents"><pre class="programlisting">
+
+static zmsg_t *
+interface_recv (interface_t *self)
+{
+    assert (self);
+    zmsg_t *msg = zmsg_recv (self-&gt;pipe);
+    return msg;
+}
+
+//  =====================================================================
+//  Asynchronous part, works in the background
+</pre></div></div><br class="example-break" /><p>This structure defines each peer that we discover and track: 
+</p><div class="example"><a id="interface-c-3"></a><p class="title"><strong>Example 8.9. UDP ping interface (interface.c) - peer class</strong></p><div class="example-contents"><pre class="programlisting">
+
+typedef struct {
+    uuid_t uuid;                //  Peer's UUID as binary blob
+    char *uuid_str;             //  UUID as printable string
+    uint64_t expires_at;
+} peer_t;
+
+#define PING_PORT_NUMBER 9999
+#define PING_INTERVAL    1000  //  Once per second
+#define PEER_EXPIRY      5000  //  Five seconds and it's gone
+
+//  Convert binary UUID to freshly allocated string
+
+static char *
+s_uuid_str (uuid_t uuid)
+{
+    char hex_char [] = "0123456789ABCDEF";
+    char *string = zmalloc (sizeof (uuid_t) * 2 + 1);
+    int byte_nbr;
+    for (byte_nbr = 0; byte_nbr &lt; sizeof (uuid_t); byte_nbr++) {
+        string [byte_nbr * 2 + 0] = hex_char [uuid [byte_nbr] &gt;&gt; 4];
+        string [byte_nbr * 2 + 1] = hex_char [uuid [byte_nbr] &amp; 15];
+    }
+    return string;
+}
+</pre></div></div><br class="example-break" /><p>We have a constructor and destructor for the peer class: 
+</p><div class="example"><a id="interface-c-4"></a><p class="title"><strong>Example 8.10. UDP ping interface (interface.c) - peer constructor and destructor</strong></p><div class="example-contents"><pre class="programlisting">
+
+static peer_t *
+peer_new (uuid_t uuid)
+{
+    peer_t *self = (peer_t *) zmalloc (sizeof (peer_t));
+    memcpy (self-&gt;uuid, uuid, sizeof (uuid_t));
+    self-&gt;uuid_str = s_uuid_str (self-&gt;uuid);
+    return self;
+}
+
+//  Destroy peer object
+
+static void
+peer_destroy (peer_t **self_p)
+{
+    assert (self_p);
+    if (*self_p) {
+        peer_t *self = *self_p;
+        free (self-&gt;uuid_str);
+        free (self);
+        *self_p = NULL;
+    }
+}
+</pre></div></div><br class="example-break" /><p>These methods return the peer's UUID in binary format or as a printable string: 
+</p><div class="example"><a id="interface-c-5"></a><p class="title"><strong>Example 8.11. UDP ping interface (interface.c) - peer methods</strong></p><div class="example-contents"><pre class="programlisting">
+
+static byte *
+peer_uuid (peer_t *self)
+{
+    assert (self);
+    return self-&gt;uuid;
+}
+
+static char *
+peer_uuid_str (peer_t *self)
+{
+    assert (self);
+    return self-&gt;uuid_str;
+}
+
+//  Just resets the peers expiry time; we call this method
+//  whenever we get any activity from a peer.
+
+static void
+peer_is_alive (peer_t *self)
+{
+    assert (self);
+    self-&gt;expires_at = zclock_time () + PEER_EXPIRY;
+}
+
+//  Peer hash calls this handler automatically whenever we delete
+//  peer from agent peers, or destroy that hash table.
+
+static void
+peer_freefn (void *argument)
+{
+    peer_t *peer = (peer_t *) argument;
+    peer_destroy (&amp;peer);
+}
+</pre></div></div><br class="example-break" /><p>This structure holds the context for our agent so we can pass that around cleanly to methods that need it: 
+</p><div class="example"><a id="interface-c-6"></a><p class="title"><strong>Example 8.12. UDP ping interface (interface.c) - agent class</strong></p><div class="example-contents"><pre class="programlisting">
+
+typedef struct {
+    zctx_t *ctx;                //  CZMQ context
+    void *pipe;                 //  Pipe back to application
+    udp_t *udp;                 //  UDP object
+    uuid_t uuid;                //  Our UUID as binary blob
+    zhash_t *peers;             //  Hash of known peers, fast lookup
+} agent_t;
+</pre></div></div><br class="example-break" /><p>Now we create the constructor and destructor for our agent. Each interface has one agent object, which implements its background thread: 
+</p><div class="example"><a id="interface-c-7"></a><p class="title"><strong>Example 8.13. UDP ping interface (interface.c) - agent constructor and destructor</strong></p><div class="example-contents"><pre class="programlisting">
+
+static agent_t *
+agent_new (zctx_t *ctx, void *pipe)
+{
+    agent_t *self = (agent_t *) zmalloc (sizeof (agent_t));
+    self-&gt;ctx = ctx;
+    self-&gt;pipe = pipe;
+    self-&gt;udp = udp_new (PING_PORT_NUMBER);
+    self-&gt;peers = zhash_new ();
+    uuid_generate (self-&gt;uuid);
+    return self;
+}
+
+static void
+agent_destroy (agent_t **self_p)
+{
+    assert (self_p);
+    if (*self_p) {
+        agent_t *self = *self_p;
+        zhash_destroy (&amp;self-&gt;peers);
+        udp_destroy (&amp;self-&gt;udp);
+        free (self);
+        *self_p = NULL;
+    }
+}
+...
+</pre></div></div><br class="example-break" /><p>This is how we handle a beacon coming into our UDP socket; this may be from other peers or an echo of our own broadcast beacon: 
+</p><div class="example"><a id="interface-c-8"></a><p class="title"><strong>Example 8.14. UDP ping interface (interface.c) - handle beacon</strong></p><div class="example-contents"><pre class="programlisting">
+
+
+static int
+agent_handle_beacon (agent_t *self)
+{
+    uuid_t uuid;
+    ssize_t size = udp_recv (self-&gt;udp, uuid, sizeof (uuid_t));
+
+    //  If we got a UUID and it's not our own beacon, we have a peer
+    if (size == sizeof (uuid_t)
+    &amp;&amp;  memcmp (uuid, self-&gt;uuid, sizeof (uuid))) {
+        char *uuid_str = s_uuid_str (uuid);
+        
+        //  Find or create peer via its UUID string
+        peer_t *peer = (peer_t *) zhash_lookup (self-&gt;peers, uuid_str);
+        if (peer == NULL) {
+            peer = peer_new (uuid);
+            zhash_insert (self-&gt;peers, uuid_str, peer);
+            zhash_freefn (self-&gt;peers, uuid_str, peer_freefn);
+            
+            //  Report peer joined the network
+            zstr_sendm (self-&gt;pipe, "JOINED");
+            zstr_send (self-&gt;pipe, uuid_str);
+        }
+        //  Any activity from the peer means it's alive
+        peer_is_alive (peer);
+        free (uuid_str);
+    }
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>This method checks one peer item for expiration; if the peer hasn't sent us anything by now, it's "dead" and we can delete it: 
+</p><div class="example"><a id="interface-c-9"></a><p class="title"><strong>Example 8.15. UDP ping interface (interface.c) - reap peers</strong></p><div class="example-contents"><pre class="programlisting">
+
+static int
+agent_reap_peer (const char *key, void *item, void *argument)
+{
+    agent_t *self = (agent_t *) argument;
+    peer_t *peer = (peer_t *) item;
+    if (zclock_time () &gt;= peer-&gt;expires_at) {
+        //  Report peer left the network
+        zstr_sendm (self-&gt;pipe, "LEFT");
+        zstr_send (self-&gt;pipe, peer_uuid_str (peer));
+        zhash_delete (self-&gt;peers, peer_uuid_str (peer));
+    }
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>This is the main loop for the background agent. It uses <code class="literal">zmq_poll</code> to monitor the frontend pipe (commands from the API) and the backend UDP handle (beacons): 
+</p><div class="example"><a id="interface-c-10"></a><p class="title"><strong>Example 8.16. UDP ping interface (interface.c) - agent main loop</strong></p><div class="example-contents"><pre class="programlisting">
+
+static void
+interface_agent (void *args, zctx_t *ctx, void *pipe)
+{
+    //  Create agent instance to pass around
+    agent_t *self = agent_new (ctx, pipe);
+    
+    //  Send first beacon immediately
+    uint64_t ping_at = zclock_time ();
+    zmq_pollitem_t pollitems [] = {
+        { self-&gt;pipe, 0, ZMQ_POLLIN, 0 },
+        { 0, udp_handle (self-&gt;udp), ZMQ_POLLIN, 0 }
+    };
+    while (!zctx_interrupted) {
+        long timeout = (long) (ping_at - zclock_time ());
+        if (timeout &lt; 0)
+            timeout = 0;
+        if (zmq_poll (pollitems, 2, timeout * ZMQ_POLL_MSEC) == -1)
+            break;              //  Interrupted
+
+        //  If we had activity on the pipe, go handle the control
+        //  message. Current code never sends control messages.
+        if (pollitems [0].revents &amp; ZMQ_POLLIN)
+            agent_control_message (self);
+
+        //  If we had input on the UDP socket, go process that
+        if (pollitems [1].revents &amp; ZMQ_POLLIN)
+            agent_handle_beacon (self);
+
+        //  If we passed the 1-second mark, broadcast our beacon
+        if (zclock_time () &gt;= ping_at) {
+            udp_send (self-&gt;udp, self-&gt;uuid, sizeof (uuid_t));
+            ping_at = zclock_time () + PING_INTERVAL;
+        }
+        //  Delete and report any expired peers
+        zhash_foreach (self-&gt;peers, agent_reap_peer, self);
+    }
+    agent_destroy (&amp;self);
+}
+</pre></div></div><br class="example-break" /><p>When I run this in two windows, it reports one peer joining the network. I kill that peer and a few seconds later, it tells me the peer left:</p><pre class="screen">--------------------------------------
+[006] JOINED
+[032] 418E98D4B7184844B7D5E0EE5691084C
+--------------------------------------
+[004] LEFT
+[032] 418E98D4B7184844B7D5E0EE5691084C
+</pre><p>What's nice about a ØMQ-message based API is that I can wrap this any way I like. For instance, I can turn it into callbacks if I really want those. I can also trace all activity on the API very easily.</p><p>Some notes about tuning. On Ethernet, five seconds (the expiry time I used in this code) seems like a lot. On a badly stressed WiFi network, you can get ping latencies of 30 seconds or more. If you use a too-aggressive value for the expiry, you'll disconnect nodes that are still there. On the other side, end user applications expect a certain liveliness. If it takes 30 seconds to report that a node has gone, users will get annoyed.</p><p>A decent strategy is to detect and report disappeared nodes rapidly, but only delete them after a longer interval. Visually, a node would be green when it's alive, then gray for a while as it went out of reach, then finally disappear. We're not doing this now, but will do it in the real implementation of the as-yet-unnamed framework we're making.</p><p>As we will also see later, we have to treat any input from a node, not just UDP beacons, as a sign of life. UDP may get squashed when there's a lot of TCP traffic. This is perhaps the main reason we're not using an existing UDP discovery library: it's necessary to integrate this tightly with our ØMQ messaging for it to work.</p></div><div class="sect2" title="More About UDP"><div class="titlepage"><div><div><h3 class="title"><a id="idp21302864"></a>More About UDP</h3></div></div></div><p>So we have discovery and presence working over UDP IPv4 broadcasts. It's not ideal, but it works for the local networks we have today. However we can't use UDP for real work, not without additional work to make it reliable. There's a joke about UDP but sometimes you'll get it, and sometimes you won't.</p><p>We'll stick to TCP for all one-to-one messaging. There is one more use case for UDP after discovery, which is multicast file distribution. I'll explain why and how, then shelve that for another day. The why is simple: what we call "social networks" is just augmented culture. We create culture by sharing, and this means more and more sharing works that we make or remix. Photos, documents, contracts, tweets. The clouds of devices we're aiming towards do more of this, not less.</p><p>Now, there are two principal patterns for sharing content. One is the pub-sub pattern where one node sends out content to a set of other nodes simultaneously. Second is the "late joiner" pattern, where a node arrives somewhat later and wants to catch up to the conversation. We can deal with the late joiner using TCP unicast. But doing TCP unicast to a group of clients at the same time has some disadvantages. First, it can be slower than multicast. Second, it's unfair because some will get the content before others.</p><p>Before you jump off to design a UDP multicast protocol, realize that it's not a simple calculation. When you send a multicast packet, the WiFi access point uses a low bit rate to ensure that even the furthest devices will get it safely. Most normal APs don't do the obvious optimization, which is to measure the distance of the furthest device and use that bit rate. Instead, they just use a fixed value. So if you have a few devices close to the AP, multicast will be insanely slow. But if you have a roomful of devices which all want to get the next chapter of the textbook, multicast can be insanely effective.</p><p>The curves cross at about 6-12 devices depending on the network. In theory, you could measure the curves in real time and create an adaptive protocol. That would be cool but probably too hard for even the smartest of us.</p><p>If you do sit down and sketch out a UDP multicast protocol, realize that you need a channel for recovery, to get lost packets. You'd probably want to do this over TCP, using ØMQ. For now, however, we'll forget about multicast UDP and assume all traffic goes over TCP.</p></div></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch08s02.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch08.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch08s04.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">The Secret Life of WiFi </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Spinning Off a Library Project</td></tr></table></div></body></html>

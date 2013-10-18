@@ -1,0 +1,291 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>A High-Level API for ØMQ</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch03.html" title="Chapter 3. Advanced Request-Reply Patterns" /><link rel="prev" href="ch03s04.html" title="The Load Balancing Pattern" /><link rel="next" href="ch03s06.html" title="The Asynchronous Client/Server Pattern" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">A High-Level API for ØMQ</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch03s04.html">Prev</a> </td><th width="60%" align="center">Chapter 3. Advanced Request-Reply Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch03s06.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="A High-Level API for ØMQ"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp19483224"></a>A High-Level API for ØMQ</h2></div></div></div><p>We're going to push request-reply onto the stack and open a different area, which is the ØMQ API itself. There's a reason for this detour: as we write more complex examples, the low-level ØMQ API starts to look increasingly clumsy. Look at the core of the worker thread from our load balancing broker:</p><pre class="programlisting">
+while (true) {
+    //  Get one address frame and empty delimiter
+    char *address = s_recv (worker);
+    char *empty = s_recv (worker);
+    assert (*empty == 0);
+    free (empty);
+
+    //  Get request, send reply
+    char *request = s_recv (worker);
+    printf ("Worker: %s\n", request);
+    free (request);
+
+    s_sendmore (worker, address);
+    s_sendmore (worker, "");
+    s_send     (worker, "OK");
+    free (address);
+}
+</pre><p>That code isn't even reusable because it can only handle one reply address in the envelope, and it already does some wrapping around the ØMQ API. If we used the <code class="literal">libzmq</code> simple message API this is what we'd have to write:</p><pre class="programlisting">
+while (true) {
+    //  Get one address frame and empty delimiter
+    char address [255];
+    int address_size = zmq_recv (worker, address, 255, 0);
+    if (address_size == -1)
+        break;
+
+    char empty [1];
+    int empty_size = zmq_recv (worker, empty, 1, 0);
+    zmq_recv (worker, &amp;empty, 0);
+    assert (empty_size &lt;= 0);
+    if (empty_size == -1)
+        break;
+
+    //  Get request, send reply
+    char request [256];
+    int request_size = zmq_recv (worker, request, 255, 0);
+    if (request_size == -1)
+        return NULL;
+    request [request_size] = 0;
+    printf ("Worker: %s\n", request);
+    
+    zmq_send (worker, address, address_size, ZMQ_SNDMORE);
+    zmq_send (worker, empty, 0, ZMQ_SNDMORE);
+    zmq_send (worker, "OK", 2, 0);
+}
+</pre><p>And when code is too long to write quickly, it's also too long to understand. Up until now, I've stuck to the native API because, as ØMQ users, we need to know that intimately. But when it gets in our way, we have to treat it as a problem to solve.</p><p>We can't of course just change the ØMQ API, which is a documented public contract on which thousands of people agree and depend. Instead, we construct a higher-level API on top based on our experience so far, and most specifically, our experience from writing more complex request-reply patterns.</p><p>What we want is an API that lets us receive and send an entire message in one shot, including the reply envelope with any number of reply addresses. One that lets us do what we want with the absolute least lines of code.</p><p>Making a good message API is fairly difficult. We have a problem of terminology: ØMQ uses "message" to describe both multipart messages, and individual message frames. We have a problem of expectations: sometimes it's natural to see message content as printable string data, sometimes as binary blobs. And we have technical challenges, especially if we want to avoid copying data around too much.</p><p>The challenge of making a good API affects all languages, though my specific use case is C. Whatever language you use, think about how you could contribute to your language binding to make it as good (or better) than the C binding I'm going to describe.</p><div class="sect2" title="Features of a Higher-Level API"><div class="titlepage"><div><div><h3 class="title"><a id="idp19490664"></a>Features of a Higher-Level API</h3></div></div></div><p>My solution is to use three fairly natural and obvious concepts: <span class="emphasis"><em>string</em></span> (already the basis for our <code class="literal">s_send</code> and <code class="literal">s_recv</code>) helpers, <span class="emphasis"><em>frame</em></span> (a message frame), and <span class="emphasis"><em>message</em></span> (a list of one or more frames). Here is the worker code, rewritten onto an API using these concepts:</p><pre class="programlisting">
+while (true) {
+    zmsg_t *msg = zmsg_recv (worker);
+    zframe_reset (zmsg_last (msg), "OK", 2);
+    zmsg_send (&amp;msg, worker);
+}
+</pre><p>Cutting the amount of code we need to read and write complex messages is great: the results are easy to read and understand. Let's continue this process for other aspects of working with ØMQ. Here's a wish list of things I'd like in a higher-level API, based on my experience with ØMQ so far:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p><span class="emphasis"><em>Automatic handling of sockets.</em></span> I find it cumbersome to have to close sockets manually, and to have to explicitly define the linger timeout in some (but not all) cases. It'd be great to have a way to close sockets automatically when I close the context.</p></li><li class="listitem"><p><span class="emphasis"><em>Portable thread management.</em></span> Every nontrivial ØMQ application uses threads, but POSIX threads aren't portable. So a decent high-level API should hide this under a portable layer.</p></li><li class="listitem"><p><span class="emphasis"><em>Piping from parent to child threads.</em></span> It's a recurrent problem: how to signal between parent and child threads. Our API should provide a ØMQ message pipe (using PAIR sockets and <code class="literal">inproc</code> automatically.</p></li><li class="listitem"><p><span class="emphasis"><em>Portable clocks.</em></span> Even getting the time to a millisecond resolution, or sleeping for some milliseconds, is not portable. Realistic ØMQ applications need portable clocks, so our API should provide them.</p></li><li class="listitem"><p><span class="emphasis"><em>A reactor to replace <code class="literal">zmq_poll()</code>.</em></span> The poll loop is simple, but clumsy. Writing a lot of these, we end up doing the same work over and over: calculating timers, and calling code when sockets are ready. A simple reactor with socket readers and timers would save a lot of repeated work.</p></li><li class="listitem"><p><span class="emphasis"><em>Proper handling of Ctrl-C.</em></span> We already saw how to catch an interrupt. It would be useful if this happened in all applications.</p></li></ul></div></div><div class="sect2" title="The CZMQ High-Level API"><div class="titlepage"><div><div><h3 class="title"><a id="idp19498192"></a>The CZMQ High-Level API</h3></div></div></div><p>Turning this wish list into reality for the C language gives us <a class="ulink" href="http://zero.mq/c" target="_top">CZMQ</a>, a ØMQ language binding for C. This high-level binding, in fact, developed out of earlier versions of the examples. It combines nicer semantics for working with ØMQ with some portability layers, and (importantly for C, but less for other languages) containers like hashes and lists. CZMQ also uses an elegant object model that leads to frankly lovely code.</p><p>Here is the load balancing broker rewritten to use a higher-level API (CZMQ for the C case):</p><div class="example"><a id="lbbroker2-c"></a><p class="title"><strong>Example 3.10. Load balancing broker using high-level API (lbbroker2.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Load-balancing broker
+//  Demonstrates use of the CZMQ API
+
+#include "czmq.h"
+
+#define NBR_CLIENTS 10
+#define NBR_WORKERS 3
+#define WORKER_READY   "\001"      //  Signals worker is ready
+
+//  Basic request-reply client using REQ socket
+//
+static void *
+client_task (void *args)
+{
+    zctx_t *ctx = zctx_new ();
+    void *client = zsocket_new (ctx, ZMQ_REQ);
+    zsocket_connect (client, "ipc://frontend.ipc");
+
+    //  Send request, get reply
+    while (true) {
+        zstr_send (client, "HELLO");
+        char *reply = zstr_recv (client);
+        if (!reply)
+            break;
+        printf ("Client: %s\n", reply);
+        free (reply);
+        sleep (1);
+    }
+    zctx_destroy (&amp;ctx);
+    return NULL;
+}
+
+//  Worker using REQ socket to do load-balancing
+//
+static void *
+worker_task (void *args)
+{
+    zctx_t *ctx = zctx_new ();
+    void *worker = zsocket_new (ctx, ZMQ_REQ);
+    zsocket_connect (worker, "ipc://backend.ipc");
+
+    //  Tell broker we're ready for work
+    zframe_t *frame = zframe_new (WORKER_READY, 1);
+    zframe_send (&amp;frame, worker, 0);
+
+    //  Process messages as they arrive
+    while (true) {
+        zmsg_t *msg = zmsg_recv (worker);
+        if (!msg)
+            break;              //  Interrupted
+        zframe_reset (zmsg_last (msg), "OK", 2);
+        zmsg_send (&amp;msg, worker);
+    }
+    zctx_destroy (&amp;ctx);
+    return NULL;
+}
+</pre></div></div><br class="example-break" /><p>Now we come to the main task. This has the identical functionality to the previous <code class="literal">lbbroker</code> broker example, but uses CZMQ to start child threads, to hold the list of workers, and to read and send messages: 
+</p><div class="example"><a id="lbbroker2-c-1"></a><p class="title"><strong>Example 3.11. Load balancing broker using high-level API (lbbroker2.c) - main task</strong></p><div class="example-contents"><pre class="programlisting">
+
+int main (void)
+{
+    zctx_t *ctx = zctx_new ();
+    void *frontend = zsocket_new (ctx, ZMQ_ROUTER);
+    void *backend = zsocket_new (ctx, ZMQ_ROUTER);
+    zsocket_bind (frontend, "ipc://frontend.ipc");
+    zsocket_bind (backend, "ipc://backend.ipc");
+
+    int client_nbr;
+    for (client_nbr = 0; client_nbr &lt; NBR_CLIENTS; client_nbr++)
+        zthread_new (client_task, NULL);
+    int worker_nbr;
+    for (worker_nbr = 0; worker_nbr &lt; NBR_WORKERS; worker_nbr++)
+        zthread_new (worker_task, NULL);
+
+    //  Queue of available workers
+    zlist_t *workers = zlist_new ();
+</pre></div></div><br class="example-break" /><p>Here is the main loop for the load balancer. It works the same way as the previous example, but is a lot shorter because CZMQ gives us an API that does more with fewer calls: 
+</p><div class="example"><a id="lbbroker2-c-2"></a><p class="title"><strong>Example 3.12. Load balancing broker using high-level API (lbbroker2.c) - main load-balancer loop</strong></p><div class="example-contents"><pre class="programlisting">
+
+        zmq_pollitem_t items [] = {
+            { backend,  0, ZMQ_POLLIN, 0 },
+            { frontend, 0, ZMQ_POLLIN, 0 }
+        };
+        //  Poll frontend only if we have available workers
+        int rc = zmq_poll (items, zlist_size (workers)? 2: 1, -1);
+        if (rc == -1)
+            break;              //  Interrupted
+
+        //  Handle worker activity on backend
+        if (items [0].revents &amp; ZMQ_POLLIN) {
+            //  Use worker identity for load-balancing
+            zmsg_t *msg = zmsg_recv (backend);
+            if (!msg)
+                break;          //  Interrupted
+            zframe_t *identity = zmsg_unwrap (msg);
+            zlist_append (workers, identity);
+
+            //  Forward message to client if it's not a READY
+            zframe_t *frame = zmsg_first (msg);
+            if (memcmp (zframe_data (frame), WORKER_READY, 1) == 0)
+                zmsg_destroy (&amp;msg);
+            else
+                zmsg_send (&amp;msg, frontend);
+        }
+        if (items [1].revents &amp; ZMQ_POLLIN) {
+            //  Get client request, route to first available worker
+            zmsg_t *msg = zmsg_recv (frontend);
+            if (msg) {
+                zmsg_wrap (msg, (zframe_t *) zlist_pop (workers));
+                zmsg_send (&amp;msg, backend);
+            }
+        }
+    }
+    //  When we're done, clean up properly
+    while (zlist_size (workers)) {
+        zframe_t *frame = (zframe_t *) zlist_pop (workers);
+        zframe_destroy (&amp;frame);
+    }
+    zlist_destroy (&amp;workers);
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>One thing CZMQ provides is clean interrupt handling. This means that Ctrl-C will cause any blocking ØMQ call to exit with a return code -1 and errno set to <code class="literal">EINTR</code>. The high-level recv methods will return NULL in such cases. So, you can cleanly exit a loop like this:</p><pre class="programlisting">
+while (true) {
+    zstr_send (client, "Hello");
+    char *reply = zstr_recv (client);
+    if (!reply)
+        break;              //  Interrupted
+    printf ("Client: %s\n", reply);
+    free (reply);
+    sleep (1);
+}
+</pre><p>Or, if you're calling <code class="literal">zmq_poll()</code>, test on the return code:</p><pre class="programlisting">
+if (zmq_poll (items, 2, 1000 * 1000) == -1)
+    break;              //  Interrupted
+</pre><p>The previous example still uses <code class="literal">zmq_poll()</code>. So how about reactors? The CZMQ <code class="literal">zloop</code> reactor is simple but functional. It lets you:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Set a reader on any socket, i.e., code that is called whenever the socket has input.</p></li><li class="listitem"><p>Cancel a reader on a socket.</p></li><li class="listitem"><p>Set a timer that goes off once or multiple times at specific intervals.</p></li><li class="listitem"><p>Cancel a timer.</p></li></ul></div><p><code class="literal">zloop</code> of course uses <code class="literal">zmq_poll()</code> internally. It rebuilds its poll set each time you add or remove readers, and it calculates the poll timeout to match the next timer. Then, it calls the reader and timer handlers for each socket and timer that need attention.</p><p>When we use a reactor pattern, our code turns inside out. The main logic looks like this:</p><pre class="programlisting">
+zloop_t *reactor = zloop_new ();
+zloop_reader (reactor, self-&gt;backend, s_handle_backend, self);
+zloop_start (reactor);
+zloop_destroy (&amp;reactor);
+</pre><p>The actual handling of messages sits inside dedicated functions or methods. You may not like the style--it's a matter of taste. What it does help with is mixing timers and socket activity. In the rest of this text, we'll use <code class="literal">zmq_poll()</code> in simpler cases, and <code class="literal">zloop</code> in more complex examples.</p><p>Here is the load balancing broker rewritten once again, this time to use <code class="literal">zloop</code>:</p><div class="example"><a id="lbbroker3-c"></a><p class="title"><strong>Example 3.13. Load balancing broker using zloop (lbbroker3.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Load-balancing broker
+//  Demonstrates use of the CZMQ API and reactor style
+//
+//  The client and worker tasks are identical from the previous example.
+...
+//  Our load-balancer structure, passed to reactor handlers
+typedef struct {
+    void *frontend;             //  Listen to clients
+    void *backend;              //  Listen to workers
+    zlist_t *workers;           //  List of ready workers
+} lbbroker_t;
+</pre></div></div><br class="example-break" /><p>In the reactor design, each time a message arrives on a socket, the reactor passes it to a handler function. We have two handlers; one for the frontend, one for the backend: 
+</p><div class="example"><a id="lbbroker3-c-1"></a><p class="title"><strong>Example 3.14. Load balancing broker using zloop (lbbroker3.c) - reactor design</strong></p><div class="example-contents"><pre class="programlisting">
+
+//  Handle input from client, on frontend
+int s_handle_frontend (zloop_t *loop, zmq_pollitem_t *poller, void *arg)
+{
+    lbbroker_t *self = (lbbroker_t *) arg;
+    zmsg_t *msg = zmsg_recv (self-&gt;frontend);
+    if (msg) {
+        zmsg_wrap (msg, (zframe_t *) zlist_pop (self-&gt;workers));
+        zmsg_send (&amp;msg, self-&gt;backend);
+
+        //  Cancel reader on frontend if we went from 1 to 0 workers
+        if (zlist_size (self-&gt;workers) == 0) {
+            zmq_pollitem_t poller = { self-&gt;frontend, 0, ZMQ_POLLIN };
+            zloop_poller_end (loop, &amp;poller);
+        }
+    }
+    return 0;
+}
+
+//  Handle input from worker, on backend
+int s_handle_backend (zloop_t *loop, zmq_pollitem_t *poller, void *arg)
+{
+    //  Use worker identity for load-balancing
+    lbbroker_t *self = (lbbroker_t *) arg;
+    zmsg_t *msg = zmsg_recv (self-&gt;backend);
+    if (msg) {
+        zframe_t *identity = zmsg_unwrap (msg);
+        zlist_append (self-&gt;workers, identity);
+
+        //  Enable reader on frontend if we went from 0 to 1 workers
+        if (zlist_size (self-&gt;workers) == 1) {
+            zmq_pollitem_t poller = { self-&gt;frontend, 0, ZMQ_POLLIN };
+            zloop_poller (loop, &amp;poller, s_handle_frontend, self);
+        }
+        //  Forward message to client if it's not a READY
+        zframe_t *frame = zmsg_first (msg);
+        if (memcmp (zframe_data (frame), WORKER_READY, 1) == 0)
+            zmsg_destroy (&amp;msg);
+        else
+            zmsg_send (&amp;msg, self-&gt;frontend);
+    }
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>And the main task now sets up child tasks, then starts its reactor. If you press Ctrl-C, the reactor exits and the main task shuts down. Because the reactor is a CZMQ class, this example may not translate into all languages equally well. 
+</p><div class="example"><a id="lbbroker3-c-2"></a><p class="title"><strong>Example 3.15. Load balancing broker using zloop (lbbroker3.c) - main task</strong></p><div class="example-contents"><pre class="programlisting">
+
+int main (void)
+{
+    zctx_t *ctx = zctx_new ();
+    lbbroker_t *self = (lbbroker_t *) zmalloc (sizeof (lbbroker_t));
+    self-&gt;frontend = zsocket_new (ctx, ZMQ_ROUTER);
+    self-&gt;backend = zsocket_new (ctx, ZMQ_ROUTER);
+    zsocket_bind (self-&gt;frontend, "ipc://frontend.ipc");
+    zsocket_bind (self-&gt;backend, "ipc://backend.ipc");
+
+    int client_nbr;
+    for (client_nbr = 0; client_nbr &lt; NBR_CLIENTS; client_nbr++)
+        zthread_new (client_task, NULL);
+    int worker_nbr;
+    for (worker_nbr = 0; worker_nbr &lt; NBR_WORKERS; worker_nbr++)
+        zthread_new (worker_task, NULL);
+
+    //  Queue of available workers
+    self-&gt;workers = zlist_new ();
+
+    //  Prepare reactor and fire it up
+    zloop_t *reactor = zloop_new ();
+    zmq_pollitem_t poller = { self-&gt;backend, 0, ZMQ_POLLIN };
+    zloop_poller (reactor, &amp;poller, s_handle_backend, self);
+    zloop_start  (reactor);
+    zloop_destroy (&amp;reactor);
+
+    //  When we're done, clean up properly
+    while (zlist_size (self-&gt;workers)) {
+        zframe_t *frame = (zframe_t *) zlist_pop (self-&gt;workers);
+        zframe_destroy (&amp;frame);
+    }
+    zlist_destroy (&amp;self-&gt;workers);
+    zctx_destroy (&amp;ctx);
+    free (self);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>Getting applications to properly shut down when you send them Ctrl-C can be tricky. If you use the <code class="literal">zctx</code> class it'll automatically set up signal handling, but your code still has to cooperate. You must break any loop if <code class="literal">zmq_poll</code> returns -1 or if any of the <code class="literal">zstr_recv</code>, <code class="literal">zframe_recv</code>, or <code class="literal">zmsg_recv</code> methods return NULL. If you have nested loops, it can be useful to make the outer ones conditional on <code class="literal">!zctx_interrupted</code>.</p><p>If you're using child threads, they won't receive the interrupt. To tell them to shutdown, you can either:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Destroy the context, if they are sharing the same context, in which case any blocking calls they are waiting on will end with ETERM.</p></li><li class="listitem"><p>Send them shutdown messages, if they are using their own contexts. For this you'll need some socket plumbing.</p></li></ul></div></div></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch03s04.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch03.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch03s06.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">The Load Balancing Pattern </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> The Asynchronous Client/Server Pattern</td></tr></table></div></body></html>

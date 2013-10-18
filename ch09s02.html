@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>How This Book Happened</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch09.html" title="Chapter 9. Postface" /><link rel="prev" href="ch09.html" title="Chapter 9. Postface" /><link rel="next" href="ch09s03.html" title="Removing Friction" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">How This Book Happened</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch09.html">Prev</a> </td><th width="60%" align="center">Chapter 9. Postface</th><td width="20%" align="right"> <a accesskey="n" href="ch09s03.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="How This Book Happened"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp21512824"></a>How This Book Happened</h2></div></div></div><p>When I set out to write a ØMQ book, we were still debating the pros and cons of forks and pull requests in the ØMQ community. Today, for what it's worth, this argument seems settled: the "liberal" policy that we adopted for <code class="literal">libzmq</code> in early 2012 broke our dependency on a single prime author, and opened the floor to dozens of new contributors. More profoundly, it allowed us to move to a gently organic evolutionary model that was very different from the older forced-march model.</p><p>The reason I was confident this would work was that our work on the Guide had, for a year or more, shown the way. True, the text is my own work, which is perhaps as it should be. Writing is not programming. When we write, we tell a story and one doesn't want different voices telling one tale; it feels strange.</p><p>For me the real long-term value of the book is the repository of examples: about 65,000 lines of code in 24 different languages. It's partly about making ØMQ accessible to more people. People already refer to the Python and PHP example repositories--two of the most complete--when they want to tell others how to learn ØMQ. But it's also about learning programming languages.</p><p>Here's a loop of code in Tcl:</p><pre class="programlisting">
+while {1} {
+    # Process all parts of the message
+    zmq message message
+    frontend recv_msg message
+    set more [frontend getsockopt RCVMORE]
+    backend send_msg message [expr {$more?"SNDMORE":""}]
+    message close
+    if {!$more} {
+        break ; # Last message part
+    }
+}
+</pre><p>And here's the same loop in Lua:</p><pre class="programlisting">
+while true do
+    --  Process all parts of the message
+    local msg = frontend:recv()
+    if (frontend:getopt(zmq.RCVMORE) == 1) then
+        backend:send(msg, zmq.SNDMORE)
+    else
+        backend:send(msg, 0)
+        break;      --  Last message part
+    end
+end
+</pre><p>And this particular example (<code class="literal">rrbroker</code>) exists in in C#, C++, CL, Clojure, Erlang, F#, Go, Haskell, Haxe, Java, Lua, Node.js, Perl, PHP, Python, Ruby, Scala, Tcl, and of course C. This code base, all provided as open source under the MIT/X11 license, may form the basis for other books or projects.</p><p>But what this collection of translations says most profoundly is this: the language you choose is a detail, even a distraction. The power of ØMQ lies in the patterns it gives you and lets you build, and these transcend the comings and goings of languages. My goal as a software and social architect is to build structures that can last generations. There seems no point in aiming for mere decades.</p></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch09.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch09.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch09s03.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Chapter 9. Postface </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Removing Friction</td></tr></table></div></body></html>

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Exploring ROUTER Sockets</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch03.html" title="Chapter 3. Advanced Request-Reply Patterns" /><link rel="prev" href="ch03s02.html" title="Request-Reply Combinations" /><link rel="next" href="ch03s04.html" title="The Load Balancing Pattern" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Exploring ROUTER Sockets</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch03s02.html">Prev</a> </td><th width="60%" align="center">Chapter 3. Advanced Request-Reply Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch03s04.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Exploring ROUTER Sockets"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp19415696"></a>Exploring ROUTER Sockets</h2></div></div></div><p>Let's look at ROUTER sockets a little closer. We've already seen how they work by routing individual messages to specific connections. I'll explain in more detail how we identify those connections, and what a ROUTER socket does when it can't send a message.</p><div class="sect2" title="Identities and Addresses"><div class="titlepage"><div><div><h3 class="title"><a id="idp19416472"></a>Identities and Addresses</h3></div></div></div><p>The <span class="emphasis"><em>identity</em></span> concept in ØMQ refers specifically to ROUTER sockets and how they identify the connections they have to other sockets. More broadly, identities are used as addresses in the reply envelope. In most cases, the identity is arbitrary and local to the ROUTER socket: it's a lookup key in a hash table. Independently, a peer can have an address that is physical (a network endpoint like "tcp://192.168.55.117:5670") or logical (a UUID or email address or other unique key).</p><p>An application that uses a ROUTER socket to talk to specific peers can convert a logical address to an identity if it has built the necessary hash table. Because ROUTER sockets only announce the identity of a connection (to a specific peer) when that peer sends a message, you can only really reply to a message, not spontaneously talk to a peer.</p><p>This is true even if you flip the rules and make the ROUTER connect to the peer rather than wait for the peer to connect to the ROUTER. However you can force the ROUTER socket to use a logical address in place of its identity. The <code class="literal">zmq_setsockopt</code> reference page calls this <span class="emphasis"><em>setting the socket identity</em></span>. It works as follows:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The peer application sets the <code class="literal">ZMQ_IDENTITY</code> option of its peer socket (DEALER or REQ) <span class="emphasis"><em>before</em></span> binding or connecting.</p></li><li class="listitem"><p>Usually the peer then connects to the already-bound ROUTER socket. But the ROUTER can also connect to the peer.</p></li><li class="listitem"><p>At connection time, the peer socket tells the router socket, "please use this identity for this connection".</p></li><li class="listitem"><p>If the peer socket doesn't say that, the router generates its usual arbitrary random identity for the connection.</p></li><li class="listitem"><p>The ROUTER socket now provides this logical address to the application as a prefix identity frame for any messages coming in from that peer.</p></li><li class="listitem"><p>The ROUTER also expects the logical address as the prefix identity frame for any outgoing messages.</p></li></ul></div><p>Here is a simple example of two peers that connect to a ROUTER socket, one that imposes a logical address "PEER2":</p><div class="example"><a id="identity-c"></a><p class="title"><strong>Example 3.1. Identity check (identity.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Demonstrate request-reply identities
+
+#include "zhelpers.h"
+
+int main (void) 
+{
+    void *context = zmq_ctx_new ();
+    void *sink = zmq_socket (context, ZMQ_ROUTER);
+    zmq_bind (sink, "inproc://example");
+
+    //  First allow 0MQ to set the identity
+    void *anonymous = zmq_socket (context, ZMQ_REQ);
+    zmq_connect (anonymous, "inproc://example");
+    s_send (anonymous, "ROUTER uses a generated UUID");
+    s_dump (sink);
+
+    //  Then set the identity ourselves
+    void *identified = zmq_socket (context, ZMQ_REQ);
+    zmq_setsockopt (identified, ZMQ_IDENTITY, "PEER2", 5);
+    zmq_connect (identified, "inproc://example");
+    s_send (identified, "ROUTER socket uses REQ's socket identity");
+    s_dump (sink);
+
+    zmq_close (sink);
+    zmq_close (anonymous);
+    zmq_close (identified);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>Here is what the program prints:</p><pre class="screen">----------------------------------------
+[005] 006B8B4567
+[000]
+[026] ROUTER uses a generated UUID
+----------------------------------------
+[005] PEER2
+[000]
+[038] ROUTER uses REQ's socket identity
+</pre></div><div class="sect2" title="ROUTER Error Handling"><div class="titlepage"><div><div><h3 class="title"><a id="idp19425000"></a>ROUTER Error Handling</h3></div></div></div><p>ROUTER sockets do have a somewhat brutal way of dealing with messages they can't send anywhere: they drop them silently. It's an attitude that makes sense in working code, but it makes debugging hard. The "send identity as first frame" approach is tricky enough that we often get this wrong when we're learning, and the ROUTER's stony silence when we mess up isn't very constructive.</p><p>Since ØMQ v3.2 there's a socket option you can set to catch this error: <code class="literal">ZMQ_ROUTER_MANDATORY</code>. Set that on the ROUTER socket and then when you provide an unroutable identity on a send call, the socket will signal an <code class="literal">EHOSTUNREACH</code> error.</p></div></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch03s02.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch03.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch03s04.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Request-Reply Combinations </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> The Load Balancing Pattern</td></tr></table></div></body></html>

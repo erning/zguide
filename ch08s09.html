@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Content Distribution</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch08.html" title="Chapter 8. A Framework for Distributed Computing" /><link rel="prev" href="ch08s08.html" title="Distributed Logging and Monitoring" /><link rel="next" href="ch08s10.html" title="Writing the Unprotocol" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Content Distribution</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch08s08.html">Prev</a> </td><th width="60%" align="center">Chapter 8. A Framework for Distributed Computing</th><td width="20%" align="right"> <a accesskey="n" href="ch08s10.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Content Distribution"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp21473656"></a>Content Distribution</h2></div></div></div><p>We now have a robust framework for creating groups of nodes, letting them chat to each other, and monitoring the resulting network. Next step is to allow them to distribute content as files.</p><p>As usual, we'll aim for the very simplest plausible solution and then improve that step-by-step. At the very least we want the following:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>An application can tell the Zyre API, "Publish this file", and provide the path to a file that exists somewhere in the file system.</p></li><li class="listitem"><p>Zyre will distribute that file to all peers, both those that are on the network at that time, and those that arrive later.</p></li><li class="listitem"><p>Each time an interface receives a file it tells its application, "Here is this file".</p></li></ul></div><p>We might eventually want more discrimination, e.g., publishing to specific groups. We can add that later if it's needed. In Advanced Architecture using ØMQ<a class="xref" href="ch07.html" title="Chapter 7. Advanced Architecture using ØMQ">Chapter 7, <em>Advanced Architecture using ØMQ</em></a> we developed a file distribution system (FileMQ) designed to be plugged into ØMQ applications. So let's use that.</p><p>Each node is going to be a file publisher and a file subscriber. We bind the publisher to an ephemeral port (if we use the standard FileMQ port 5670, we can't run multiple interfaces on one box), and we broadcast the publisher's endpoint in the <code class="literal">HELLO</code> message, as we did for the log collector. This lets us interconnect all nodes so that all subscribers talk to all publishers.</p><p>We need to ensure that each node has its own directory for sending and receiving files (the outbox and the inbox). Again, it's so we can run multiple nodes on one box. Because we already have a unique ID per node, we just use that in the directory name.</p><p>Here's how we set up the FileMQ API when we create a new interface:</p><pre class="programlisting">
+sprintf (self-&gt;fmq_outbox, ".outbox/%s", self-&gt;identity);
+mkdir (self-&gt;fmq_outbox, 0775);
+
+sprintf (self-&gt;fmq_inbox, ".inbox/%s", self-&gt;identity);
+mkdir (self-&gt;fmq_inbox, 0775);
+
+self-&gt;fmq_server = fmq_server_new ();
+self-&gt;fmq_service = fmq_server_bind (self-&gt;fmq_server, "tcp://*:*");
+fmq_server_publish (self-&gt;fmq_server, self-&gt;fmq_outbox, "/");
+fmq_server_set_anonymous (self-&gt;fmq_server, true);
+char publisher [32];
+sprintf (publisher, "tcp://%s:%d", self-&gt;host, self-&gt;fmq_service);
+zhash_update (self-&gt;headers, "X-FILEMQ", strdup (publisher));
+
+//  Client will connect as it discovers new nodes
+self-&gt;fmq_client = fmq_client_new ();
+fmq_client_set_inbox (self-&gt;fmq_client, self-&gt;fmq_inbox);
+fmq_client_set_resync (self-&gt;fmq_client, true);
+fmq_client_subscribe (self-&gt;fmq_client, "/");
+</pre><p>And when we process a <code class="literal">HELLO</code> command, we check for the <code class="literal">X-FILEMQ</code> header field:</p><pre class="programlisting">
+//  If peer is a FileMQ publisher, connect to it
+char *publisher = zre_msg_headers_string (msg, "X-FILEMQ", NULL);
+if (publisher)
+    fmq_client_connect (self-&gt;fmq_client, publisher);
+</pre><p>The last thing is to expose content distribution in the Zyre API. We need two things:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>A way for the application to say, "Publish this file"</p></li><li class="listitem"><p>A way for the interface to tell the application, "We received this file".</p></li></ul></div><p>In theory, the application can publish a file just by creating a symbolic link in the outbox directory, but as we're using a hidden outbox, this is a little difficult. So we add an API method <code class="literal">publish</code>:</p><pre class="programlisting">
+//  Publish file into virtual space
+void
+zre_interface_publish (zre_interface_t *self,
+                       char *filename, char *external)
+{
+    zstr_sendm (self-&gt;pipe, "PUBLISH");
+    zstr_sendm (self-&gt;pipe, filename);  //  Real file name
+    zstr_send  (self-&gt;pipe, external);  //  Location in virtual space
+}
+</pre><p>The API passes this to the interface thread, which creates the file in the outbox directory so that the FileMQ server will pick it up and broadcast it. We could literally copy file data into this directory, but because FileMQ supports symbolic links, we use that instead. The file has a ".ln" extension and contains one line, which contains the actual pathname.</p><p>Finally, how do we notify the recipient that a file has arrived? The FileMQ <code class="literal">fmq_client</code> API has a message, "DELIVER", for this, so all we have to do in <code class="literal">zre_interface</code> is grab this message from the <code class="literal">fmq_client</code> API and pass it on to our own API:</p><pre class="programlisting">
+zmsg_t *msg = fmq_client_recv (fmq_client_handle (self-&gt;fmq_client));
+zmsg_send (&amp;msg, self-&gt;pipe);
+</pre><p>This is complex code that does a lot at once. But we're only at around 10K lines of code for FileMQ and Zyre together. The most complex Zyre class, <code class="literal">zre_interface</code>, is 800 lines of code. This is compact. Message-based applications do keep their shape if you're careful to organize them properly.</p></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch08s08.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch08.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch08s10.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Distributed Logging and Monitoring </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Writing the Unprotocol</td></tr></table></div></body></html>

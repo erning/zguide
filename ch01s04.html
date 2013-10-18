@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>提问-回答</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch01.html" title="Chapter 1. ØMQ基础" /><link rel="prev" href="ch01s03.html" title="获取示例" /><link rel="next" href="ch01s05.html" title="关于字符串" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">提问-回答</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch01s03.html">Prev</a> </td><th width="60%" align="center">Chapter 1. ØMQ基础</th><td width="20%" align="right"> <a accesskey="n" href="ch01s05.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="提问-回答"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp15605528"></a>提问-回答</h2></div></div></div><p>让我们从简单的代码开始，一段传统的Hello World程序。我们会创建一个客户端和一个服务端，客户端发送Hello给服务端，服务端返回World。下文是C语言编写的服务端，它在5555端口打开一个ØMQ套接字，等待请求，收到后应答World。</p><div class="example"><a id="hwserver-c"></a><p class="title"><strong>Example 1.1. Hello World server (hwserver.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Hello World server
+
+#include &lt;zmq.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;string.h&gt;
+#include &lt;assert.h&gt;
+
+int main (void)
+{
+    //  Socket to talk to clients
+    void *context = zmq_ctx_new ();
+    void *responder = zmq_socket (context, ZMQ_REP);
+    int rc = zmq_bind (responder, "tcp://*:5555");
+    assert (rc == 0);
+
+    while (1) {
+        char buffer [10];
+        zmq_recv (responder, buffer, 10, 0);
+        printf ("Received Hello\n");
+        sleep (1);          //  Do some 'work'
+        zmq_send (responder, "World", 5, 0);
+    }
+    return 0;
+}
+</pre></div></div><br class="example-break" /><div class="figure"><a id="figure-2"></a><p class="title"><strong>Figure 1.1. Request-Reply</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig2.png" alt="Request-Reply" /></div></div></div><br class="figure-break" /><p>使用REQ-REP套接字发送和接受消息是需要遵循一定规律的。客户端首先使用<code class="literal">zmq_send()</code>发送消息，再用<code class="literal">zmq_recv()</code>接收，如此循环。如果打乱了这个顺序（如连续发送两次）则会报错。类似地，服务端必须先进行接收，后进行发送。</p><p>ØMQ使用C语言作为它参考手册的语言，本指南也以它作为示例程序的语言。如果你正在阅读本指南的在线版本，你可以看到示例代码的下方有其他语言的实现。如以下是C++语言：</p><div class="example"><a id="hwserver-cpp"></a><p class="title"><strong>Example 1.2. Hello World server (hwserver.cpp)</strong></p><div class="example-contents"><pre class="programlisting">
+//
+//  Hello World server in C++
+//  Binds REP socket to tcp://*:5555
+//  Expects "Hello" from client, replies with "World"
+//
+#include &lt;zmq.hpp&gt;
+#include &lt;string&gt;
+#include &lt;iostream&gt;
+#ifndef _WIN32
+#include &lt;unistd.h&gt;
+#else
+#include &lt;windows.h&gt;
+#endif
+
+int main () {
+    //  Prepare our context and socket
+    zmq::context_t context (1);
+    zmq::socket_t socket (context, ZMQ_REP);
+    socket.bind ("tcp://*:5555");
+
+    while (true) {
+        zmq::message_t request;
+
+        //  Wait for next request from client
+        socket.recv (&amp;request);
+        std::cout &lt;&lt; "Received Hello" &lt;&lt; std::endl;
+
+        //  Do some 'work'
+#ifndef _WIN32
+    	sleep(1);
+#else
+	Sleep (1);
+#endif
+
+        //  Send reply back to client
+        zmq::message_t reply (5);
+        memcpy ((void *) reply.data (), "World", 5);
+        socket.send (reply);
+    }
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>可以看到C语言和C++语言的API代码差不多，而在PHP或Java这样的语言中，代码就会更为简洁：</p><div class="example"><a id="hwserver-php"></a><p class="title"><strong>Example 1.3. Hello World server (hwserver.php)</strong></p><div class="example-contents"><pre class="programlisting">
+&lt;?php
+/*
+ *  Hello World server
+ *  Binds REP socket to tcp://*:5555
+ *  Expects "Hello" from client, replies with "World"
+ * @author Ian Barber &lt;ian(dot)barber(at)gmail(dot)com&gt;
+ */
+
+$context = new ZMQContext(1);
+
+//  Socket to talk to clients
+$responder = new ZMQSocket($context, ZMQ::SOCKET_REP);
+$responder-&gt;bind("tcp://*:5555");
+
+while (true) {
+    //  Wait for next request from client
+    $request = $responder-&gt;recv();
+    printf ("Received request: [%s]\n", $request);
+
+    //  Do some 'work'
+    sleep (1);
+
+    //  Send reply back to client
+    $responder-&gt;send("World");
+}
+</pre></div></div><br class="example-break" /><div class="example"><a id="hwserver-java"></a><p class="title"><strong>Example 1.4. Hello World server (hwserver.java)</strong></p><div class="example-contents"><pre class="programlisting">
+//
+//  Hello World server in Java
+//  Binds REP socket to tcp://*:5555
+//  Expects "Hello" from client, replies with "World"
+//
+
+import org.zeromq.ZMQ;
+
+public class hwserver{
+
+    public static void main (String[] args) throws Exception{
+        ZMQ.Context context = ZMQ.context(1);
+        //  Socket to talk to clients
+        ZMQ.Socket socket = context.socket(ZMQ.REP);
+        socket.bind ("tcp://*:5555");
+
+        while (!Thread.currentThread ().isInterrupted ()) {
+            byte[] reply = socket.recv(0);
+            System.out.println("Received Hello");
+            String request = "World" ;
+            socket.send(request.getBytes (), 0);
+            Thread.sleep(1000); //  Do some 'work'
+        }
+        socket.close();
+        context.term();
+    }
+}
+</pre></div></div><br class="example-break" /><p>下面是客户端的代码：</p><div class="example"><a id="hwclient-c"></a><p class="title"><strong>Example 1.5. Hello World client (hwclient.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Hello World client
+#include &lt;zmq.h&gt;
+#include &lt;string.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;unistd.h&gt;
+
+int main (void)
+{
+    printf ("Connecting to hello world server...\n");
+    void *context = zmq_ctx_new ();
+    void *requester = zmq_socket (context, ZMQ_REQ);
+    zmq_connect (requester, "tcp://localhost:5555");
+
+    int request_nbr;
+    for (request_nbr = 0; request_nbr != 10; request_nbr++) {
+        char buffer [10];
+        printf ("Sending Hello %d...\n", request_nbr);
+        zmq_send (requester, "Hello", 5, 0);
+        zmq_recv (requester, buffer, 10, 0);
+        printf ("Received World %d\n", request_nbr);
+    }
+    zmq_close (requester);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>这看起来是否太简单了？ØMQ就是这样一个东西，你往里加点儿料就能制作出一枚无穷能量的原子弹，用它来拯救世界吧！理论上你可以连接千万个客户端到这个服务端上，同时连接都没问题，程序仍会运作得很好。你可以尝试一下先打开客户端，再打开服务端，可以看到程序仍然会正常工作，想想这意味着什么。</p><p>让我简单介绍一下这两段程序到底做了什么。首先，他们创建了一个ØMQ上下文，然后是一个套接字。不要被这些陌生的名词吓到，后面我们都会讲到。服务端将REP套接字绑定到5555端口上，并开始等待请求，发出应答，如此循环。客户端则是发送请求并等待服务端的应答。</p><p>If you kill the server (Ctrl-C) and restart it, the client won't recover properly. Recovering from crashing processes isn't quite that easy. Making a reliable request-reply flow is complex enough that we won't cover it until Reliable Request-Reply Patterns<a class="xref" href="ch04.html" title="Chapter 4. Reliable Request-Reply Patterns">Chapter 4, <em>Reliable Request-Reply Patterns</em></a>.</p><p>这些代码背后其实发生了很多很多事情，但是程序员完全不必理会这些，只要知道这些代码短小精悍，极少出错，耐高压。这种通信模式我们称之为请求-应答模式，是ZMQ最直接的一种应用。你可以拿它和RPC及经典的C/S模型做类比。</p></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch01s03.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch01.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch01s05.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">获取示例 </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> 关于字符串</td></tr></table></div></body></html>

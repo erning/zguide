@@ -1,0 +1,284 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Messaging Patterns</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch02.html" title="Chapter 2. Sockets and Patterns" /><link rel="prev" href="ch02.html" title="Chapter 2. Sockets and Patterns" /><link rel="next" href="ch02s03.html" title="Handling Errors and ETERM" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Messaging Patterns</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch02.html">Prev</a> </td><th width="60%" align="center">Chapter 2. Sockets and Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch02s03.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Messaging Patterns"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp19134552"></a>Messaging Patterns</h2></div></div></div><p>Underneath the brown paper wrapping of ØMQ's socket API lies the world of messaging patterns. If you have a background in enterprise messaging, or know UDP well, these will be vaguely familiar. But to most ØMQ newcomers, they are a surprise. We're so used to the TCP paradigm where a socket maps one-to-one to another node.</p><p>Let's recap briefly what ØMQ does for you. It delivers blobs of data (messages) to nodes, quickly and efficiently. You can map nodes to threads, processes, or nodes. ØMQ gives your applications a single socket API to work with, no matter what the actual transport (like in-process, inter-process, TCP, or multicast). It automatically reconnects to peers as they come and go. It queues messages at both sender and receiver, as needed. It manages these queues carefully to ensure processes don't run out of memory, overflowing to disk when appropriate. It handles socket errors. It does all I/O in background threads. It uses lock-free techniques for talking between nodes, so there are never locks, waits, semaphores, or deadlocks.</p><p>But cutting through that, it routes and queues messages according to precise recipes called <span class="emphasis"><em>patterns</em></span>. It is these patterns that provide ØMQ's intelligence. They encapsulate our hard-earned experience of the best ways to distribute data and work. ØMQ's patterns are hard-coded but future versions may allow user-definable patterns.</p><p>ØMQ patterns are implemented by pairs of sockets with matching types. In other words, to understand ØMQ patterns you need to understand socket types and how they work together. Mostly, this just takes study; there is little that is obvious at this level.</p><p>The built-in core ØMQ patterns are:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p><span class="bold"><strong>Request-reply</strong></span>, which connects a set of clients to a set of services. This is a remote procedure call and task distribution pattern.</p></li><li class="listitem"><p><span class="bold"><strong>Pub-sub</strong></span>, which connects a set of publishers to a set of subscribers. This is a data distribution pattern.</p></li><li class="listitem"><p><span class="bold"><strong>Pipeline</strong></span>, which connects nodes in a fan-out/fan-in pattern that can have multiple steps and loops. This is a parallel task distribution and collection pattern.</p></li><li class="listitem"><p><span class="bold"><strong>Exclusive pair</strong></span>, which connects two sockets exclusively. This is a pattern for connecting two threads in a process, not to be confused with "normal" pairs of sockets.</p></li></ul></div><p>We looked at the first three of these in ØMQ基础<a class="xref" href="ch01.html" title="Chapter 1. ØMQ基础">Chapter 1, <em>ØMQ基础</em></a>, and we'll see the exclusive pair pattern later in this chapter. The <code class="literal">zmq_socket()</code> man page is fairly clear about the patterns -- it's worth reading several times until it starts to make sense. These are the socket combinations that are valid for a connect-bind pair (either side can bind):</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>PUB and SUB</p></li><li class="listitem"><p>REQ and REP</p></li><li class="listitem"><p>REQ and ROUTER</p></li><li class="listitem"><p>DEALER and REP</p></li><li class="listitem"><p>DEALER and ROUTER</p></li><li class="listitem"><p>DEALER and DEALER</p></li><li class="listitem"><p>ROUTER and ROUTER</p></li><li class="listitem"><p>PUSH and PULL</p></li><li class="listitem"><p>PAIR and PAIR</p></li></ul></div><p>You'll also see references to XPUB and XSUB sockets, which we'll come to later (they're like raw versions of PUB and SUB). Any other combination will produce undocumented and unreliable results, and future versions of ØMQ will probably return errors if you try them. You can and will, of course, bridge other socket types via code, i.e., read from one socket type and write to another.</p><div class="sect2" title="High-Level Messaging Patterns"><div class="titlepage"><div><div><h3 class="title"><a id="idp19144304"></a>High-Level Messaging Patterns</h3></div></div></div><p>These four core patterns are cooked into ØMQ. They are part of the ØMQ API, implemented in the core C++ library, and are guaranteed to be available in all fine retail stores.</p><p>On top of those, we add <span class="emphasis"><em>high-level messaging patterns</em></span>. We build these high-level patterns on top of ØMQ and implement them in whatever language we're using for our application. They are not part of the core library, do not come with the ØMQ package, and exist in their own space as part of the ØMQ community. For example the Majordomo pattern, which we explore in Reliable Request-Reply Patterns<a class="xref" href="ch04.html" title="Chapter 4. Reliable Request-Reply Patterns">Chapter 4, <em>Reliable Request-Reply Patterns</em></a>, sits in the GitHub Majordomo project in the ZeroMQ organization.</p><p>One of the things we aim to provide you with in this book are a set of such high-level patterns, both small (how to handle messages sanely) and large (how to make a reliable pub-sub architecture).</p></div><div class="sect2" title="Working with Messages"><div class="titlepage"><div><div><h3 class="title"><a id="idp19147088"></a>Working with Messages</h3></div></div></div><p>The <code class="literal">libzmq</code> core library has in fact two APIs to send and receive messages. The <code class="literal">zmq_send()</code> and <code class="literal">zmq_recv()</code> methods that we've already seen and used are simple one-liners. We will use these often, but <code class="literal">zmq_recv()</code> is bad at dealing with arbitrary message sizes: it truncates messages to whatever buffer size you provide. So there's a second API that works with zmq_msg_t structures, with a richer but more difficult API:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Initialise a message: <code class="literal">zmq_msg_init()</code>, <code class="literal">zmq_msg_init_size()</code>, <code class="literal">zmq_msg_init_data()</code>.</p></li><li class="listitem"><p>Sending and receiving a message: <code class="literal">zmq_msg_send()</code>, <code class="literal">zmq_msg_recv()</code>.</p></li><li class="listitem"><p>Release a message: <code class="literal">zmq_msg_close()</code>.</p></li><li class="listitem"><p>Access message content: <code class="literal">zmq_msg_data()</code>, <code class="literal">zmq_msg_size()</code>, <code class="literal">zmq_msg_more()</code>.</p></li><li class="listitem"><p>Work with message properties: <code class="literal">zmq_msg_get()</code>, <code class="literal">zmq_msg_set()</code>.</p></li><li class="listitem"><p>Message manipulation: <code class="literal">zmq_msg_copy()</code>, <code class="literal">zmq_msg_move()</code>.</p></li></ul></div><p>On the wire, ØMQ messages are blobs of any size from zero upwards that fit in memory. You do your own serialization using protocol buffers, msgpack, JSON, or whatever else your applications need to speak. It's wise to choose a data representation that is portable, but you can make your own decisions about trade-offs.</p><p>In memory, ØMQ messages are <code class="literal">zmq_msg_t</code> structures (or classes depending on your language). Here are the basic ground rules for using ØMQ messages in C:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>You create and pass around <code class="literal">zmq_msg_t</code> objects, not blocks of data.</p></li><li class="listitem"><p>To read a message, you use <code class="literal">zmq_msg_init()</code> to create an empty message, and then you pass that to <code class="literal">zmq_msg_recv()</code>.</p></li><li class="listitem"><p>To write a message from new data, you use <code class="literal">zmq_msg_init_size()</code> to create a message and at the same time allocate a block of data of some size. You then fill that data using <code class="literal">memcpy</code>, and pass the message to <code class="literal">zmq_msg_send()</code>.</p></li><li class="listitem"><p>To release (not destroy) a message, you call <code class="literal">zmq_msg_close()</code>. This drops a reference, and eventually ØMQ will destroy the message.</p></li><li class="listitem"><p>To access the message content, you use <code class="literal">zmq_msg_data()</code>. To know how much data the message contains, use <code class="literal">zmq_msg_size()</code>.</p></li><li class="listitem"><p>Do not use <code class="literal">zmq_msg_move()</code>, <code class="literal">zmq_msg_copy()</code>, or <code class="literal">zmq_msg_init_data()</code> unless you read the man pages and know precisely why you need these.</p></li><li class="listitem"><p>After you pass a message to <code class="literal">zmq_msg_send()</code>, ØMQ will clear the message, i.e., set the size to zero. You cannot send the same message twice, and you cannot access the message data after sending it.</p></li><li class="listitem"><p>These rules don't apply if you use <code class="literal">zmq_send()</code> and <code class="literal">zmq_recv()</code>, to which you pass byte arrays, not message structures.</p></li></ul></div><p>If you want to send the same message more than once, and it's sizable, create a second message, initialize it using <code class="literal">zmq_msg_init()</code>, and then use <code class="literal">zmq_msg_copy()</code> to create a copy of the first message. This does not copy the data but copies a reference. You can then send the message twice (or more, if you create more copies) and the message will only be finally destroyed when the last copy is sent or closed.</p><p>ØMQ also supports <span class="emphasis"><em>multipart</em></span> messages, which let you send or receive a list of frames as a single on-the-wire message. This is widely used in real applications and we'll look at that later in this chapter and in Advanced Request-Reply Patterns<a class="xref" href="ch03.html" title="Chapter 3. Advanced Request-Reply Patterns">Chapter 3, <em>Advanced Request-Reply Patterns</em></a>.</p><p>Frames (also called "message parts" in the ØMQ reference manual pages) are the basic wire format for ØMQ messages. A frame is a length-specified block of data. The length can be zero upwards. If you've done any TCP programming you'll appreciate why frames are a useful answer to the question "how much data am I supposed to read of this network socket now?"</p><p>There is a wire-level <a class="ulink" href="http://rfc.zeromq.org/spec:15" target="_top">protocol called ZMTP</a> that defines how ØMQ reads and writes frames on a TCP connection. If you're interested in how this works, the spec is quite short.</p><p>Originally, a ØMQ message was one frame, like UDP. We later extended this with multipart messages, which are quite simply series of frames with a "more" bit set to one, followed by one with that bit set to zero. The ØMQ API then lets you write messages with a "more" flag and when you read messages, it lets you check if there's "more".</p><p>In the low-level ØMQ API and the reference manual, therefore, there's some fuzziness about messages versus frames. So here's a useful lexicon:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>A message can be one or more parts.</p></li><li class="listitem"><p>These parts are also called "frames".</p></li><li class="listitem"><p>Each part is a <code class="literal">zmq_msg_t</code> object.</p></li><li class="listitem"><p>You send and receive each part separately, in the low-level API.</p></li><li class="listitem"><p>Higher-level APIs provide wrappers to send entire multipart messages.</p></li></ul></div><p>Some other things that are worth knowing about messages:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>You may send zero-length messages, e.g., for sending a signal from one thread to another.</p></li><li class="listitem"><p>ØMQ guarantees to deliver all the parts (one or more) for a message, or none of them.</p></li><li class="listitem"><p>ØMQ does not send the message (single or multipart) right away, but at some indeterminate later time. A multipart message must therefore fit in memory.</p></li><li class="listitem"><p>A message (single or multipart) must fit in memory. If you want to send files of arbitrary sizes, you should break them into pieces and send each piece as separate single-part messages. <span class="emphasis"><em>Using multipart data will not reduce memory consumption.</em></span></p></li><li class="listitem"><p>You must call <code class="literal">zmq_msg_close()</code> when finished with a received message, in languages that don't automatically destroy objects when a scope closes. You don't call this method after sending a message.</p></li></ul></div><p>And to be repetitive, do not use <code class="literal">zmq_msg_init_data()</code> yet. This is a zero-copy method and is guaranteed to create trouble for you. There are far more important things to learn about ØMQ before you start to worry about shaving off microseconds.</p><p>This rich API can be tiresome to work with. The methods are optimized for performance, not simplicity. If you start using these you will almost definitely get them wrong until you've read the man pages with some care. So one of the main jobs of a good language binding is to wrap this API up in classes that are easier to use.</p></div><div class="sect2" title="Handling Multiple Sockets"><div class="titlepage"><div><div><h3 class="title"><a id="idp19174568"></a>Handling Multiple Sockets</h3></div></div></div><p>In all the examples so far, the main loop of most examples has been:</p><div class="orderedlist"><ol class="orderedlist" type="1"><li class="listitem"><p>Wait for message on socket.</p></li><li class="listitem"><p>Process message.</p></li><li class="listitem"><p>Repeat.</p></li></ol></div><p>What if we want to read from multiple endpoints at the same time? The simplest way is to connect one socket to all the endpoints and get ØMQ to do the fan-in for us. This is legal if the remote endpoints are in the same pattern, but it would be wrong to connect a PULL socket to a PUB endpoint.</p><p>To actually read from multiple sockets all at once, use <code class="literal">zmq_poll()</code>. An even better way might be to wrap <code class="literal">zmq_poll()</code> in a framework that turns it into a nice event-driven <span class="emphasis"><em>reactor</em></span>, but it's significantly more work than we want to cover here.</p><p>Let's start with a dirty hack, partly for the fun of not doing it right, but mainly because it lets me show you how to do nonblocking socket reads. Here is a simple example of reading from two sockets using nonblocking reads. This rather confused program acts both as a subscriber to weather updates, and a worker for parallel tasks:</p><div class="example"><a id="msreader-c"></a><p class="title"><strong>Example 2.1. Multiple socket reader (msreader.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Reading from multiple sockets
+//  This version uses a simple recv loop
+
+#include "zhelpers.h"
+
+int main (void) 
+{
+    //  Connect to task ventilator
+    void *context = zmq_ctx_new ();
+    void *receiver = zmq_socket (context, ZMQ_PULL);
+    zmq_connect (receiver, "tcp://localhost:5557");
+
+    //  Connect to weather server
+    void *subscriber = zmq_socket (context, ZMQ_SUB);
+    zmq_connect (subscriber, "tcp://localhost:5556");
+    zmq_setsockopt (subscriber, ZMQ_SUBSCRIBE, "10001 ", 6);
+
+    //  Process messages from both sockets
+    //  We prioritize traffic from the task ventilator
+    while (1) {
+        char msg [256];
+        while (1) {
+            int size = zmq_recv (receiver, msg, 255, ZMQ_DONTWAIT);
+            if (size != -1) {
+                //  Process task
+            }
+            else
+                break;
+        }
+        while (1) {
+            int size = zmq_recv (subscriber, msg, 255, ZMQ_DONTWAIT);
+            if (size != -1) {
+                //  Process weather update
+            }
+            else
+                break;
+        }
+        //  No activity, so sleep for 1 msec
+        s_sleep (1);
+    }
+    zmq_close (receiver);
+    zmq_close (subscriber);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>The cost of this approach is some additional latency on the first message (the sleep at the end of the loop, when there are no waiting messages to process). This would be a problem in applications where submillisecond latency was vital. Also, you need to check the documentation for nanosleep() or whatever function you use to make sure it does not busy-loop.</p><p>You can treat the sockets fairly by reading first from one, then the second rather than prioritizing them as we did in this example.</p><p>Now let's see the same senseless little application done right, using <code class="literal">zmq_poll()</code>:</p><div class="example"><a id="mspoller-c"></a><p class="title"><strong>Example 2.2. Multiple socket poller (mspoller.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Reading from multiple sockets
+//  This version uses zmq_poll()
+
+#include "zhelpers.h"
+
+int main (void) 
+{
+    //  Connect to task ventilator
+    void *context = zmq_ctx_new ();
+    void *receiver = zmq_socket (context, ZMQ_PULL);
+    zmq_connect (receiver, "tcp://localhost:5557");
+
+    //  Connect to weather server
+    void *subscriber = zmq_socket (context, ZMQ_SUB);
+    zmq_connect (subscriber, "tcp://localhost:5556");
+    zmq_setsockopt (subscriber, ZMQ_SUBSCRIBE, "10001 ", 6);
+
+    //  Process messages from both sockets
+    while (1) {
+        char msg [256];
+        zmq_pollitem_t items [] = {
+            { receiver,   0, ZMQ_POLLIN, 0 },
+            { subscriber, 0, ZMQ_POLLIN, 0 }
+        };
+        zmq_poll (items, 2, -1);
+        if (items [0].revents &amp; ZMQ_POLLIN) {
+            int size = zmq_recv (receiver, msg, 255, 0);
+            if (size != -1) {
+                //  Process task
+            }
+        }
+        if (items [1].revents &amp; ZMQ_POLLIN) {
+            int size = zmq_recv (subscriber, msg, 255, 0);
+            if (size != -1) {
+                //  Process weather update
+            }
+        }
+    }
+    zmq_close (subscriber);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>The items structure has these four members:</p><pre class="programlisting">
+typedef struct {
+    void *socket;       //  0MQ socket to poll on
+    int fd;             //  OR, native file handle to poll on
+    short events;       //  Events to poll on
+    short revents;      //  Events returned after poll
+} zmq_pollitem_t;
+</pre></div><div class="sect2" title="Multipart Messages"><div class="titlepage"><div><div><h3 class="title"><a id="idp19185912"></a>Multipart Messages</h3></div></div></div><p>ØMQ lets us compose a message out of several frames, giving us a "multipart message". Realistic applications use multipart messages heavily, both for wrapping messages with address information and for simple serialization. We'll look at reply envelopes later.</p><p>What we'll learn now is simply how to blindly and safely read and write multipart messages in any application (such as a proxy) that needs to forward messages without inspecting them.</p><p>When you work with multipart messages, each part is a <code class="literal">zmq_msg</code> item. E.g., if you are sending a message with five parts, you must construct, send, and destroy five <code class="literal">zmq_msg</code> items. You can do this in advance (and store the <code class="literal">zmq_msg</code> items in an array or other structure), or as you send them, one-by-one.</p><p>Here is how we send the frames in a multipart message (we receive each frame into a message object):</p><pre class="programlisting">
+zmq_msg_send (&amp;message, socket, ZMQ_SNDMORE);
+...
+zmq_msg_send (&amp;message, socket, ZMQ_SNDMORE);
+...
+zmq_msg_send (&amp;message, socket, 0);
+</pre><p>Here is how we receive and process all the parts in a message, be it single part or multipart:</p><pre class="programlisting">
+while (1) {
+    zmq_msg_t message;
+    zmq_msg_init (&amp;message);
+    zmq_msg_recv (&amp;message, socket, 0);
+    //  Process the message frame
+    ...
+    zmq_msg_close (&amp;message);
+    if (!zmq_msg_more (&amp;message))
+        break;      //  Last message frame
+}
+</pre><p>Some things to know about multipart messages:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>When you send a multipart message, the first part (and all following parts) are only actually sent on the wire when you send the final part.</p></li><li class="listitem"><p>If you are using <code class="literal">zmq_poll()</code>, when you receive the first part of a message, all the rest has also arrived.</p></li><li class="listitem"><p>You will receive all parts of a message, or none at all.</p></li><li class="listitem"><p>Each part of a message is a separate <code class="literal">zmq_msg</code> item.</p></li><li class="listitem"><p>You will receive all parts of a message whether or not you check the more property.</p></li><li class="listitem"><p>On sending, ØMQ queues message frames in memory until the last is received, then sends them all.</p></li><li class="listitem"><p>There is no way to cancel a partially sent message, except by closing the socket.</p></li></ul></div></div><div class="sect2" title="Intermediaries and Proxies"><div class="titlepage"><div><div><h3 class="title"><a id="idp19194104"></a>Intermediaries and Proxies</h3></div></div></div><p>ØMQ aims for decentralized intelligence, but that doesn't mean your network is empty space in the middle. It's filled with message-aware infrastructure and quite often, we build that infrastructure with ØMQ. The ØMQ plumbing can range from tiny pipes to full-blown service-oriented brokers. The messaging industry calls this <span class="emphasis"><em>intermediation</em></span>, meaning that the stuff in the middle deals with either side. In ØMQ, we call these proxies, queues, forwarders, device, or brokers, depending on the context.</p><p>This pattern is extremely common in the real world and is why our societies and economies are filled with intermediaries who have no other real function than to reduce the complexity and scaling costs of larger networks. Real-world intermediaries are typically called wholesalers, distributors, managers, and so on.</p></div><div class="sect2" title="The Dynamic Discovery Problem"><div class="titlepage"><div><div><h3 class="title"><a id="idp19195912"></a>The Dynamic Discovery Problem</h3></div></div></div><p>One of the problems you will hit as you design larger distributed architectures is discovery. That is, how do pieces know about each other? It's especially difficult if pieces come and go, so we call this the "dynamic discovery problem".</p><p>There are several solutions to dynamic discovery. The simplest is to entirely avoid it by hard-coding (or configuring) the network architecture so discovery is done by hand. That is, when you add a new piece, you reconfigure the network to know about it.</p><div class="figure"><a id="figure-12"></a><p class="title"><strong>Figure 2.4. Small-Scale Pub-Sub Network</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig12.png" alt="Small-Scale Pub-Sub Network" /></div></div></div><br class="figure-break" /><p>In practice, this leads to increasingly fragile and unwieldy architectures. Let's say you have one publisher and a hundred subscribers. You connect each subscriber to the publisher by configuring a publisher endpoint in each subscriber. That's easy<a class="xref" href="ch02s02.html#figure-13" title="Figure 2.5. Pub-Sub Network with a Proxy">Figure 2.5, “Pub-Sub Network with a Proxy”</a>. Subscribers are dynamic; the publisher is static. Now say you add more publishers. Suddenly, it's not so easy any more. If you continue to connect each subscriber to each publisher, the cost of avoiding dynamic discovery gets higher and higher.</p><div class="figure"><a id="figure-13"></a><p class="title"><strong>Figure 2.5. Pub-Sub Network with a Proxy</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig13.png" alt="Pub-Sub Network with a Proxy" /></div></div></div><br class="figure-break" /><p>There are quite a few answers to this, but the very simplest answer is to add an intermediary; that is, a static point in the network to which all other nodes connect. In classic messaging, this is the job of the message broker. ØMQ doesn't come with a message broker as such, but it lets us build intermediaries quite easily.</p><p>You might wonder, if all networks eventually get large enough to need intermediaries, why don't we simply have a message broker in place for all applications? For beginners, it's a fair compromise. Just always use a star topology, forget about performance, and things will usually work. However, message brokers are greedy things; in their role as central intermediaries, they become too complex, too stateful, and eventually a problem.</p><p>It's better to think of intermediaries as simple stateless message switches. A good analogy is an HTTP proxy; it's there, but doesn't have any special role. Adding a pub-sub proxy solves the dynamic discovery problem in our example. We set the proxy in the "middle" of the network<a class="xref" href="ch02s02.html#figure-14" title="Figure 2.6. Extended Pub-Sub">Figure 2.6, “Extended Pub-Sub”</a>. The proxy opens an XSUB socket, an XPUB socket, and binds each to well-known IP addresses and ports. Then, all other processes connect to the proxy, instead of to each other. It becomes trivial to add more subscribers or publishers.</p><div class="figure"><a id="figure-14"></a><p class="title"><strong>Figure 2.6. Extended Pub-Sub</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig14.png" alt="Extended Pub-Sub" /></div></div></div><br class="figure-break" /><p>We need XPUB and XSUB sockets because ØMQ does subscription forwarding from subscribers to publishers. XSUB and XPUB are exactly like SUB and PUB except they expose subscriptions as special messages. The proxy has to forward these subscription messages from subscriber side to publisher side, by reading them from the XPUB socket and writing them to the XSUB socket. This is the main use case for XSUB and XPUB<a class="xref" href="ch02s02.html#figure-15" title="Figure 2.7. Request Distribution">Figure 2.7, “Request Distribution”</a>.</p></div><div class="sect2" title="Shared Queue (DEALER and ROUTER sockets)"><div class="titlepage"><div><div><h3 class="title"><a id="idp19205032"></a>Shared Queue (DEALER and ROUTER sockets)</h3></div></div></div><p>In the Hello World client/server application, we have one client that talks to one service. However, in real cases we usually need to allow multiple services as well as multiple clients. This lets us scale up the power of the service (many threads or processes or nodes rather than just one). The only constraint is that services must be stateless, all state being in the request or in some shared storage such as a database.</p><div class="figure"><a id="figure-15"></a><p class="title"><strong>Figure 2.7. Request Distribution</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig15.png" alt="Request Distribution" /></div></div></div><br class="figure-break" /><p>There are two ways to connect multiple clients to multiple servers. The brute force way is to connect each client socket to multiple service endpoints. One client socket can connect to multiple service sockets, and the REQ socket will then distribute requests among these services. Let's say you connect a client socket to three service endpoints; A, B, and C. The client makes requests R1, R2, R3, R4. R1 and R4 go to service A, R2 goes to B, and R3 goes to service C<a class="xref" href="ch02s02.html#figure-16" title="Figure 2.8. Extended Request-Reply">Figure 2.8, “Extended Request-Reply”</a>.</p><p>This design lets you add more clients cheaply. You can also add more services. Each client will distribute its requests to the services. But each client has to know the service topology. If you have 100 clients and then you decide to add three more services, you need to reconfigure and restart 100 clients in order for the clients to know about the three new services.</p><p>That's clearly not the kind of thing we want to be doing at 3 a.m. when our supercomputing cluster has run out of resources and we desperately need to add a couple of hundred of new service nodes. Too many static pieces are like liquid concrete: knowledge is distributed and the more static pieces you have, the more effort it is to change the topology. What we want is something sitting in between clients and services that centralizes all knowledge of the topology. Ideally, we should be able to add and remove services or clients at any time without touching any other part of the topology.</p><p>So we'll write a little message queuing broker that gives us this flexibility. The broker binds to two endpoints, a frontend for clients and a backend for services. It then uses <code class="literal">zmq_poll()</code> to monitor these two sockets for activity and when it has some, it shuttles messages between its two sockets. It doesn't actually manage any queues explicitly--ØMQ does that automatically on each socket.</p><p>When you use REQ to talk to REP, you get a strictly synchronous request-reply dialog. The client sends a request. The service reads the request and sends a reply. The client then reads the reply. If either the client or the service try to do anything else (e.g., sending two requests in a row without waiting for a response), they will get an error.</p><p>But our broker has to be nonblocking. Obviously, we can use <code class="literal">zmq_poll()</code> to wait for activity on either socket, but we can't use REP and REQ.</p><div class="figure"><a id="figure-16"></a><p class="title"><strong>Figure 2.8. Extended Request-Reply</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig16.png" alt="Extended Request-Reply" /></div></div></div><br class="figure-break" /><p>Luckily, there are two sockets called DEALER and ROUTER that let you do nonblocking request-response. You'll see in Advanced Request-Reply Patterns<a class="xref" href="ch03.html" title="Chapter 3. Advanced Request-Reply Patterns">Chapter 3, <em>Advanced Request-Reply Patterns</em></a> how DEALER and ROUTER sockets let you build all kinds of asynchronous request-reply flows. For now, we're just going to see how DEALER and ROUTER let us extend REQ-REP across an intermediary, that is, our little broker.</p><p>In this simple extended request-reply pattern, REQ talks to ROUTER and DEALER talks to REP. In between the DEALER and ROUTER, we have to have code (like our broker) that pulls messages off the one socket and shoves them onto the other<a class="xref" href="ch02s02.html#figure-17" title="Figure 2.9. Request-Reply Broker">Figure 2.9, “Request-Reply Broker”</a>.</p><p>The request-reply broker binds to two endpoints, one for clients to connect to (the frontend socket) and one for workers to connect to (the backend). To test this broker, you will want to change your workers so they connect to the backend socket. Here is a client that shows what I mean:</p><div class="example"><a id="rrclient-c"></a><p class="title"><strong>Example 2.3. Request-reply client (rrclient.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Hello World client
+//  Connects REQ socket to tcp://localhost:5559
+//  Sends "Hello" to server, expects "World" back
+
+#include "zhelpers.h"
+
+int main (void) 
+{
+    void *context = zmq_ctx_new ();
+
+    //  Socket to talk to server
+    void *requester = zmq_socket (context, ZMQ_REQ);
+    zmq_connect (requester, "tcp://localhost:5559");
+
+    int request_nbr;
+    for (request_nbr = 0; request_nbr != 10; request_nbr++) {
+        s_send (requester, "Hello");
+        char *string = s_recv (requester);
+        printf ("Received reply %d [%s]\n", request_nbr, string);
+        free (string);
+    }
+    zmq_close (requester);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>Here is the worker:</p><div class="example"><a id="rrworker-c"></a><p class="title"><strong>Example 2.4. Request-reply worker (rrworker.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Hello World worker
+//  Connects REP socket to tcp://*:5560
+//  Expects "Hello" from client, replies with "World"
+
+#include "zhelpers.h"
+
+int main (void) 
+{
+    void *context = zmq_ctx_new ();
+
+    //  Socket to talk to clients
+    void *responder = zmq_socket (context, ZMQ_REP);
+    zmq_connect (responder, "tcp://localhost:5560");
+
+    while (1) {
+        //  Wait for next request from client
+        char *string = s_recv (responder);
+        printf ("Received request: [%s]\n", string);
+        free (string);
+
+        //  Do some 'work'
+        sleep (1);
+
+        //  Send reply back to client
+        s_send (responder, "World");
+    }
+    //  We never get here, but clean up anyhow
+    zmq_close (responder);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>And here is the broker, which properly handles multipart messages:</p><div class="example"><a id="rrbroker-c"></a><p class="title"><strong>Example 2.5. Request-reply broker (rrbroker.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Simple request-reply broker
+
+#include "zhelpers.h"
+
+int main (void) 
+{
+    //  Prepare our context and sockets
+    void *context = zmq_ctx_new ();
+    void *frontend = zmq_socket (context, ZMQ_ROUTER);
+    void *backend  = zmq_socket (context, ZMQ_DEALER);
+    zmq_bind (frontend, "tcp://*:5559");
+    zmq_bind (backend,  "tcp://*:5560");
+
+    //  Initialize poll set
+    zmq_pollitem_t items [] = {
+        { frontend, 0, ZMQ_POLLIN, 0 },
+        { backend,  0, ZMQ_POLLIN, 0 }
+    };
+    //  Switch messages between sockets
+    while (1) {
+        zmq_msg_t message;
+        zmq_poll (items, 2, -1);
+        if (items [0].revents &amp; ZMQ_POLLIN) {
+            while (1) {
+                //  Process all parts of the message
+                zmq_msg_init (&amp;message);
+                zmq_msg_recv (&amp;message, frontend, 0);
+                int more = zmq_msg_more (&amp;message);
+                zmq_msg_send (&amp;message, backend, more? ZMQ_SNDMORE: 0);
+                zmq_msg_close (&amp;message);
+                if (!more)
+                    break;      //  Last message part
+            }
+        }
+        if (items [1].revents &amp; ZMQ_POLLIN) {
+            while (1) {
+                //  Process all parts of the message
+                zmq_msg_init (&amp;message);
+                zmq_msg_recv (&amp;message, backend, 0);
+                int more = zmq_msg_more (&amp;message);
+                zmq_msg_send (&amp;message, frontend, more? ZMQ_SNDMORE: 0);
+                zmq_msg_close (&amp;message);
+                if (!more)
+                    break;      //  Last message part
+            }
+        }
+    }
+    //  We never get here, but clean up anyhow
+    zmq_close (frontend);
+    zmq_close (backend);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><div class="figure"><a id="figure-17"></a><p class="title"><strong>Figure 2.9. Request-Reply Broker</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig17.png" alt="Request-Reply Broker" /></div></div></div><br class="figure-break" /><p>Using a request-reply broker makes your client/server architectures easier to scale because clients don't see workers, and workers don't see clients. The only static node is the broker in the middle<a class="xref" href="ch02s02.html#figure-18" title="Figure 2.10. Pub-Sub Forwarder Proxy">Figure 2.10, “Pub-Sub Forwarder Proxy”</a>.</p></div><div class="sect2" title="ØMQ's Built-In Proxy Function"><div class="titlepage"><div><div><h3 class="title"><a id="idp19224320"></a>ØMQ's Built-In Proxy Function</h3></div></div></div><p>It turns out that the core loop in the previous section's <code class="literal">rrbroker</code> is very useful, and reusable. It lets us build pub-sub forwarders and shared queues and other little intermediaries with very little effort. ØMQ wraps this up in a single method, <code class="literal">zmq_proxy()</code>:</p><pre class="programlisting">
+zmq_proxy (frontend, backend, capture);
+</pre><p>The two (or three sockets, if we want to capture data) must be properly connected, bound, and configured. When we call the <code class="literal">zmq_proxy</code> method, it's exactly like starting the main loop of <code class="literal">rrbroker</code>. Let's rewrite the request-reply broker to call <code class="literal">zmq_proxy</code>, and re-badge this as an expensive-sounding "message queue" (people have charged houses for code that did less):</p><div class="example"><a id="msgqueue-c"></a><p class="title"><strong>Example 2.6. Message queue broker (msgqueue.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Simple message queuing broker
+//  Same as request-reply broker but using QUEUE device
+
+#include "zhelpers.h"
+
+int main (void) 
+{
+    void *context = zmq_ctx_new ();
+
+    //  Socket facing clients
+    void *frontend = zmq_socket (context, ZMQ_ROUTER);
+    int rc = zmq_bind (frontend, "tcp://*:5559");
+    assert (rc == 0);
+
+    //  Socket facing services
+    void *backend = zmq_socket (context, ZMQ_DEALER);
+    rc = zmq_bind (backend, "tcp://*:5560");
+    assert (rc == 0);
+
+    //  Start the proxy
+    zmq_proxy (frontend, backend, NULL);
+
+    //  We never get here...
+    zmq_close (frontend);
+    zmq_close (backend);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>If you're like most ØMQ users, at this stage your mind is starting to think, "What kind of evil stuff can I do if I plug random socket types into the proxy?"  The short answer is: try it and work out what is happening. In practice, you would usually stick to ROUTER/DEALER, XSUB/XPUB, or PULL/PUSH.</p></div><div class="sect2" title="Transport Bridging"><div class="titlepage"><div><div><h3 class="title"><a id="idp19229976"></a>Transport Bridging</h3></div></div></div><p>A frequent request from ØMQ users is, "How do I connect my ØMQ network with technology X?" where X is some other networking or messaging technology.</p><div class="figure"><a id="figure-18"></a><p class="title"><strong>Figure 2.10. Pub-Sub Forwarder Proxy</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig18.png" alt="Pub-Sub Forwarder Proxy" /></div></div></div><br class="figure-break" /><p>The simple answer is to build a <span class="emphasis"><em>bridge</em></span>. A bridge is a small application that speaks one protocol at one socket, and converts to/from a second protocol at another socket. A protocol interpreter, if you like. A common bridging problem in ØMQ is to bridge two transports or networks.</p><p>As an example, we're going to write a little proxy that sits in between a publisher and a set of subscribers, bridging two networks. The frontend socket (SUB) faces the internal network where the weather server is sitting, and the backend (PUB) faces subscribers on the external network. It subscribes to the weather service on the frontend socket, and republishes its data on the backend socket.</p><div class="example"><a id="wuproxy-c"></a><p class="title"><strong>Example 2.7. Weather update proxy (wuproxy.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Weather proxy device
+
+#include "zhelpers.h"
+
+int main (void)
+{
+    void *context = zmq_ctx_new ();
+
+    //  This is where the weather server sits
+    void *frontend = zmq_socket (context, ZMQ_XSUB);
+    zmq_connect (frontend, "tcp://192.168.55.210:5556");
+
+    //  This is our public endpoint for subscribers
+    void *backend = zmq_socket (context, ZMQ_XPUB);
+    zmq_bind (backend, "tcp://10.1.1.0:8100");
+
+    //  Run the proxy until the user interrupts us
+    zmq_proxy (frontend, backend, NULL);
+    
+    zmq_close (frontend);
+    zmq_close (backend);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>It looks very similar to the earlier proxy example, but the key part is that the frontend and backend sockets are on two different networks<a class="xref" href="ch02s03.html#figure-19" title="Figure 2.11. Parallel Pipeline with Kill Signaling">Figure 2.11, “Parallel Pipeline with Kill Signaling”</a>. We can use this model for example to connect a multicast network (<code class="literal">pgm</code> transport) to a <code class="literal">tcp</code> publisher.</p></div></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch02.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch02.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch02s03.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Chapter 2. Sockets and Patterns </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Handling Errors and ETERM</td></tr></table></div></body></html>

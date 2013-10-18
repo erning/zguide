@@ -1,0 +1,559 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Worked Example: Inter-Broker Routing</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch03.html" title="Chapter 3. Advanced Request-Reply Patterns" /><link rel="prev" href="ch03s06.html" title="The Asynchronous Client/Server Pattern" /><link rel="next" href="ch04.html" title="Chapter 4. Reliable Request-Reply Patterns" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Worked Example: Inter-Broker Routing</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch03s06.html">Prev</a> </td><th width="60%" align="center">Chapter 3. Advanced Request-Reply Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch04.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Worked Example: Inter-Broker Routing"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp19552608"></a>Worked Example: Inter-Broker Routing</h2></div></div></div><p>Let's take everything we've seen so far, and scale things up to a real application. We'll build this step-by-step over several iterations. Our best client calls us urgently and asks for a design of a large cloud computing facility. He has this vision of a cloud that spans many data centers, each a cluster of clients and workers, and that works together as a whole. Because we're smart enough to know that practice always beats theory, we propose to make a working simulation using ØMQ. Our client, eager to lock down the budget before his own boss changes his mind, and having read great things about ØMQ on Twitter, agrees.</p><div class="sect2" title="Establishing the Details"><div class="titlepage"><div><div><h3 class="title"><a id="idp19553104"></a>Establishing the Details</h3></div></div></div><p>Several espressos later, we want to jump into writing code, but a little voice tells us to get more details before making a sensational solution to entirely the wrong problem. "What kind of work is the cloud doing?", we ask.</p><p>The client explains:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Workers run on various kinds of hardware, but they are all able to handle any task. There are several hundred workers per cluster, and as many as a dozen clusters in total.</p></li><li class="listitem"><p>Clients create tasks for workers. Each task is an independent unit of work and all the client wants is to find an available worker, and send it the task, as soon as possible. There will be a lot of clients and they'll come and go arbitrarily.</p></li><li class="listitem"><p>The real difficulty is to be able to add and remove clusters at any time. A cluster can leave or join the cloud instantly, bringing all its workers and clients with it.</p></li><li class="listitem"><p>If there are no workers in their own cluster, clients' tasks will go off to other available workers in the cloud.</p></li><li class="listitem"><p>Clients send out one task at a time, waiting for a reply. If they don't get an answer within X seconds, they'll just send out the task again. This isn't our concern; the client API does it already.</p></li><li class="listitem"><p>Workers process one task at a time; they are very simple beasts. If they crash, they get restarted by whatever script started them.</p></li></ul></div><p>So we double-check to make sure that we understood this correctly:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>"There will be some kind of super-duper network interconnect between clusters, right?", we ask. The client says, "Yes, of course, we're not idiots."</p></li><li class="listitem"><p>"What kind of volumes are we talking about?", we ask. The client replies, "Up to a thousand clients per cluster, each doing at most ten requests per second. Requests are small, and replies are also small, no more than 1K bytes each."</p></li></ul></div><p>So we do a little calculation and see that this will work nicely over plain TCP. 2,500 clients x 10/second x 1,000 bytes x 2 directions = 50MB/sec or 400Mb/sec, not a problem for a 1Gb network.</p><p>It's a straightforward problem that requires no exotic hardware or protocols, just some clever routing algorithms and careful design. We start by designing one cluster (one data center) and then we figure out how to connect clusters together.</p></div><div class="sect2" title="Architecture of a Single Cluster"><div class="titlepage"><div><div><h3 class="title"><a id="idp19559848"></a>Architecture of a Single Cluster</h3></div></div></div><p>Workers and clients are synchronous. We want to use the load balancing pattern to route tasks to workers. Workers are all identical; our facility has no notion of different services. Workers are anonymous; clients never address them directly. We make no attempt here to provide guaranteed delivery, retry, and so on.</p><p>For reasons we already examined, clients and workers won't speak to each other directly. It makes it impossible to add or remove nodes dynamically. So our basic model consists of the request-reply message broker we saw earlier<a class="xref" href="ch03s07.html#figure-39" title="Figure 3.14. Cluster Architecture">Figure 3.14, “Cluster Architecture”</a>.</p><div class="figure"><a id="figure-39"></a><p class="title"><strong>Figure 3.14. Cluster Architecture</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig39.png" alt="Cluster Architecture" /></div></div></div><br class="figure-break" /></div><div class="sect2" title="Scaling to Multiple Clusters"><div class="titlepage"><div><div><h3 class="title"><a id="idp19562680"></a>Scaling to Multiple Clusters</h3></div></div></div><p>Now we scale this out to more than one cluster. Each cluster has a set of clients and workers, and a broker that joins these together<a class="xref" href="ch03s07.html#figure-40" title="Figure 3.15. Multiple Clusters">Figure 3.15, “Multiple Clusters”</a>.</p><div class="figure"><a id="figure-40"></a><p class="title"><strong>Figure 3.15. Multiple Clusters</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig40.png" alt="Multiple Clusters" /></div></div></div><br class="figure-break" /><p>The question is: how do we get the clients of each cluster talking to the workers of the other cluster? There are a few possibilities, each with pros and cons:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Clients could connect directly to both brokers. The advantage is that we don't need to modify brokers or workers. But clients get more complex and become aware of the overall topology. If we want to add a third or forth cluster, for example, all the clients are affected. In effect we have to move routing and failover logic into the clients and that's not nice.</p></li><li class="listitem"><p>Workers might connect directly to both brokers. But REQ workers can't do that, they can only reply to one broker. We might use REPs but REPs don't give us customizable broker-to-worker routing like load balancing does, only the built-in load balancing. That's a fail; if we want to distribute work to idle workers, we precisely need load balancing. One solution would be to use ROUTER sockets for the worker nodes. Let's label this "Idea #1".</p></li><li class="listitem"><p>Brokers could connect to each other. This looks neatest because it creates the fewest additional connections. We can't add clusters on the fly, but that is probably out of scope. Now clients and workers remain ignorant of the real network topology, and brokers tell each other when they have spare capacity. Let's label this "Idea #2".</p></li></ul></div><p>Let's explore Idea #1. In this model, we have workers connecting to both brokers and accepting jobs from either one<a class="xref" href="ch03s07.html#figure-41" title="Figure 3.16. Idea 1: Cross-connected Workers">Figure 3.16, “Idea 1: Cross-connected Workers”</a>.</p><div class="figure"><a id="figure-41"></a><p class="title"><strong>Figure 3.16. Idea 1: Cross-connected Workers</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig41.png" alt="Idea 1: Cross-connected Workers" /></div></div></div><br class="figure-break" /><p>It looks feasible. However, it doesn't provide what we wanted, which was that clients get local workers if possible and remote workers only if it's better than waiting. Also workers will signal "ready" to both brokers and can get two jobs at once, while other workers remain idle. It seems this design fails because again we're putting routing logic at the edges.</p><p>So, idea #2 then. We interconnect the brokers and don't touch the clients or workers, which are REQs like we're used to<a class="xref" href="ch03s07.html#figure-42" title="Figure 3.17. Idea 2: Brokers Talking to Each Other">Figure 3.17, “Idea 2: Brokers Talking to Each Other”</a>.</p><div class="figure"><a id="figure-42"></a><p class="title"><strong>Figure 3.17. Idea 2: Brokers Talking to Each Other</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig42.png" alt="Idea 2: Brokers Talking to Each Other" /></div></div></div><br class="figure-break" /><p>This design is appealing because the problem is solved in one place, invisible to the rest of the world. Basically, brokers open secret channels to each other and whisper, like camel traders, "Hey, I've got some spare capacity. If you have too many clients, give me a shout and we'll deal".</p><p>In effect it is just a more sophisticated routing algorithm: brokers become subcontractors for each other. There are other things to like about this design, even before we play with real code:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>It treats the common case (clients and workers on the same cluster) as default and does extra work for the exceptional case (shuffling jobs between clusters).</p></li><li class="listitem"><p>It lets us use different message flows for the different types of work. That means we can handle them differently, e.g., using different types of network connection.</p></li><li class="listitem"><p>It feels like it would scale smoothly. Interconnecting three or more brokers doesn't get overly complex. If we find this to be a problem, it's easy to solve by adding a super-broker.</p></li></ul></div><p>We'll now make a worked example. We'll pack an entire cluster into one process. That is obviously not realistic, but it makes it simple to simulate, and the simulation can accurately scale to real processes. This is the beauty of ØMQ--you can design at the micro-level and scale that up to the macro-level. Threads become processes, and then become boxes and the patterns and logic remain the same. Each of our "cluster" processes contains client threads, worker threads, and a broker thread.</p><p>We know the basic model well by now:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The REQ client (REQ) threads create workloads and pass them to the broker (ROUTER).</p></li><li class="listitem"><p>The REQ worker (REQ) threads process workloads and return the results to the broker (ROUTER).</p></li><li class="listitem"><p>The broker queues and distributes workloads using the load balancing pattern.</p></li></ul></div></div><div class="sect2" title="Federation Versus Peering"><div class="titlepage"><div><div><h3 class="title"><a id="idp19576264"></a>Federation Versus Peering</h3></div></div></div><p>There are several possible ways to interconnect brokers. What we want is to be able to tell other brokers, "we have capacity", and then receive multiple tasks. We also need to be able to tell other brokers, "stop, we're full". It doesn't need to be perfect; sometimes we may accept jobs we can't process immediately, then we'll do them as soon as possible.</p><p>The simplest interconnect is <span class="emphasis"><em>federation</em></span>, in which brokers simulate clients and workers for each other. We would do this by connecting our frontend to the other broker's backend socket<a class="xref" href="ch03s07.html#figure-43" title="Figure 3.18. Cross-connected Brokers in Federation Model">Figure 3.18, “Cross-connected Brokers in Federation Model”</a>. Note that it is legal to both bind a socket to an endpoint and connect it to other endpoints.</p><div class="figure"><a id="figure-43"></a><p class="title"><strong>Figure 3.18. Cross-connected Brokers in Federation Model</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig43.png" alt="Cross-connected Brokers in Federation Model" /></div></div></div><br class="figure-break" /><p>This would give us simple logic in both brokers and a reasonably good mechanism: when there are no clients, tell the other broker "ready", and accept one job from it. The problem is also that it is too simple for this problem. A federated broker would be able to handle only one task at a time. If the broker emulates a lock-step client and worker, it is by definition also going to be lock-step, and if it has lots of available workers they won't be used. Our brokers need to be connected in a fully asynchronous fashion.</p><p>The federation model is perfect for other kinds of routing, especially service-oriented architectures (SOAs), which route by service name and proximity rather than load balancing or round robin. So don't dismiss it as useless, it's just not right for all use cases.</p><p>Instead of federation, let's look at a <span class="emphasis"><em>peering</em></span> approach in which brokers are explicitly aware of each other and talk over privileged channels. Let's break this down, assuming we want to interconnect N brokers. Each broker has (N - 1) peers, and all brokers are using exactly the same code and logic. There are two distinct flows of information between brokers:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Each broker needs to tell its peers how many workers it has available at any time. This can be fairly simple information--just a quantity that is updated regularly. The obvious (and correct) socket pattern for this is pub-sub. So every broker opens a PUB socket and publishes state information on that, and every broker also opens a SUB socket and connects that to the PUB socket of every other broker to get state information from its peers.</p></li><li class="listitem"><p>Each broker needs a way to delegate tasks to a peer and get replies back, asynchronously. We'll do this using ROUTER sockets; no other combination works. Each broker has two such sockets: one for tasks it receives and one for tasks it delegates. If we didn't use two sockets, it would be more work to know whether we were reading a request or a reply each time. That would mean adding more information to the message envelope.</p></li></ul></div><p>And there is also the flow of information between a broker and its local clients and workers.</p></div><div class="sect2" title="The Naming Ceremony"><div class="titlepage"><div><div><h3 class="title"><a id="idp19583256"></a>The Naming Ceremony</h3></div></div></div><p>Three flows x two sockets for each flow = six sockets that we have to manage in the broker.  Choosing good names is vital to keeping a multisocket juggling act reasonably coherent in our minds. Sockets <span class="emphasis"><em>do</em></span> something and what they do should form the basis for their names. It's about being able to read the code several weeks later on a cold Monday morning before coffee, and not feel any pain.</p><p>Let's do a shamanistic naming ceremony for the sockets. The three flows are:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>A <span class="emphasis"><em>local</em></span> request-reply flow between the broker and its clients and workers.</p></li><li class="listitem"><p>A <span class="emphasis"><em>cloud</em></span> request-reply flow between the broker and its peer brokers.</p></li><li class="listitem"><p>A <span class="emphasis"><em>state</em></span> flow between the broker and its peer brokers.</p></li></ul></div><p>Finding meaningful names that are all the same length means our code will align nicely. It's not a big thing, but attention to details helps. For each flow the broker has two sockets that we can orthogonally call the <span class="emphasis"><em>frontend</em></span> and <span class="emphasis"><em>backend</em></span>. We've used these names quite often. A frontend receives information or tasks. A backend sends those out to other peers. The conceptual flow is from front to back (with replies going in the opposite direction from back to front).</p><p>So in all the code we write for this tutorial, we will use these socket names:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p><span class="emphasis"><em>localfe</em></span> and <span class="emphasis"><em>localbe</em></span> for the local flow.</p></li><li class="listitem"><p><span class="emphasis"><em>cloudfe</em></span> and <span class="emphasis"><em>cloudbe</em></span> for the cloud flow.</p></li><li class="listitem"><p><span class="emphasis"><em>statefe</em></span> and <span class="emphasis"><em>statebe</em></span> for the state flow.</p></li></ul></div><p>For our transport and because we're simulating the whole thing on one box, we'll use <code class="literal">ipc</code> for everything. This has the advantage of working like <code class="literal">tcp</code> in terms of connectivity (i.e., it's a disconnected transport, unlike <code class="literal">inproc</code>), yet we don't need IP addresses or DNS names, which would be a pain here. Instead, we will use <code class="literal">ipc</code> endpoints called <span class="emphasis"><em>something</em></span>-<code class="literal">local</code>, <span class="emphasis"><em>something</em></span>-<code class="literal">cloud</code>, and <span class="emphasis"><em>something</em></span>-<code class="literal">state</code>, where <span class="emphasis"><em>something</em></span> is the name of our simulated cluster.</p><p>You might be thinking that this is a lot of work for some names. Why not call them s1, s2, s3, s4, etc.? The answer is that if your brain is not a perfect machine, you need a lot of help when reading code, and we'll see that these names do help. It's easier to remember "three flows, two directions" than "six different sockets"<a class="xref" href="ch03s07.html#figure-44" title="Figure 3.19. Broker Socket Arrangement">Figure 3.19, “Broker Socket Arrangement”</a>.</p><div class="figure"><a id="figure-44"></a><p class="title"><strong>Figure 3.19. Broker Socket Arrangement</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig44.png" alt="Broker Socket Arrangement" /></div></div></div><br class="figure-break" /><p>Note that we connect the cloudbe in each broker to the cloudfe in every other broker, and likewise we connect the statebe in each broker to the statefe in every other broker.</p></div><div class="sect2" title="Prototyping the State Flow"><div class="titlepage"><div><div><h3 class="title"><a id="idp19595632"></a>Prototyping the State Flow</h3></div></div></div><p>Because each socket flow has its own little traps for the unwary, we will test them in real code one-by-one, rather than try to throw the whole lot into code in one go. When we're happy with each flow, we can put them together into a full program. We'll start with the state flow<a class="xref" href="ch03s07.html#figure-45" title="Figure 3.20. The State Flow">Figure 3.20, “The State Flow”</a>.</p><div class="figure"><a id="figure-45"></a><p class="title"><strong>Figure 3.20. The State Flow</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig45.png" alt="The State Flow" /></div></div></div><br class="figure-break" /><p>Here is how this works in code:</p><div class="example"><a id="peering1-c"></a><p class="title"><strong>Example 3.19. Prototype state flow (peering1.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Broker peering simulation (part 1)
+//  Prototypes the state flow
+
+#include "czmq.h"
+
+int main (int argc, char *argv [])
+{
+    //  First argument is this broker's name
+    //  Other arguments are our peers' names
+    //
+    if (argc &lt; 2) {
+        printf ("syntax: peering1 me {you}...\n");
+        return 0;
+    }
+    char *self = argv [1];
+    printf ("I: preparing broker at %s...\n", self);
+    srandom ((unsigned) time (NULL));
+
+    zctx_t *ctx = zctx_new ();
+    
+    //  Bind state backend to endpoint
+    void *statebe = zsocket_new (ctx, ZMQ_PUB);
+    zsocket_bind (statebe, "ipc://%s-state.ipc", self);
+    
+    //  Connect statefe to all peers
+    void *statefe = zsocket_new (ctx, ZMQ_SUB);
+    zsocket_set_subscribe (statefe, "");
+    int argn;
+    for (argn = 2; argn &lt; argc; argn++) {
+        char *peer = argv [argn];
+        printf ("I: connecting to state backend at '%s'\n", peer);
+        zsocket_connect (statefe, "ipc://%s-state.ipc", peer);
+    }
+</pre></div></div><br class="example-break" /><p>The main loop sends out status messages to peers, and collects status messages back from peers. The zmq_poll timeout defines our own heartbeat: 
+</p><div class="example"><a id="peering1-c-1"></a><p class="title"><strong>Example 3.20. Prototype state flow (peering1.c) - main loop</strong></p><div class="example-contents"><pre class="programlisting">
+    while (true) {
+        //  Poll for activity, or 1 second timeout
+        zmq_pollitem_t items [] = { { statefe, 0, ZMQ_POLLIN, 0 } };
+        int rc = zmq_poll (items, 1, 1000 * ZMQ_POLL_MSEC);
+        if (rc == -1)
+            break;              //  Interrupted
+
+        //  Handle incoming status messages
+        if (items [0].revents &amp; ZMQ_POLLIN) {
+            char *peer_name = zstr_recv (statefe);
+            char *available = zstr_recv (statefe);
+            printf ("%s - %s workers free\n", peer_name, available);
+            free (peer_name);
+            free (available);
+        }
+        else {
+            //  Send random values for worker availability
+            zstr_sendm (statebe, self);
+            zstr_send  (statebe, "%d", randof (10));
+        }
+    }
+    zctx_destroy (&amp;ctx);
+    return EXIT_SUCCESS;
+}
+</pre></div></div><br class="example-break" /><p>Notes about this code:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Each broker has an identity that we use to construct <code class="literal">ipc</code> endpoint names. A real broker would need to work with TCP and a more sophisticated configuration scheme. We'll look at such schemes later in this book, but for now, using generated <code class="literal">ipc</code> names lets us ignore the problem of where to get TCP/IP addresses or names.</p></li><li class="listitem"><p>We use a <code class="literal">zmq_poll()</code> loop as the core of the program. This processes incoming messages and sends out state messages. We send a state message <span class="emphasis"><em>only</em></span> if we did not get any incoming messages <span class="emphasis"><em>and</em></span> we waited for a second. If we send out a state message each time we get one in, we'll get message storms.</p></li><li class="listitem"><p>We use a two-part pub-sub message consisting of sender address and data. Note that we will need to know the address of the publisher in order to send it tasks, and the only way is to send this explicitly as a part of the message.</p></li><li class="listitem"><p>We don't set identities on subscribers because if we did then we'd get outdated state information when connecting to running brokers.</p></li><li class="listitem"><p>We don't set a HWM on the publisher, but if we were using ØMQ v2.x that would be a wise idea.</p></li></ul></div><p>We can build this little program and run it three times to simulate three clusters. Let's call them DC1, DC2, and DC3 (the names are arbitrary). We run these three commands, each in a separate window:</p><pre class="screen">peering1 DC1 DC2 DC3  #  Start DC1 and connect to DC2 and DC3
+peering1 DC2 DC1 DC3  #  Start DC2 and connect to DC1 and DC3
+peering1 DC3 DC1 DC2  #  Start DC3 and connect to DC1 and DC2
+</pre><p>You'll see each cluster report the state of its peers, and after a few seconds they will all happily be printing random numbers once per second. Try this and satisfy yourself that the three brokers all match up and synchronize to per-second state updates.</p><p>In real life, we'd not send out state messages at regular intervals, but rather whenever we had a state change, i.e., whenever a worker becomes available or unavailable. That may seem like a lot of traffic, but state messages are small and we've established that the inter-cluster connections are super fast.</p><p>If we wanted to send state messages at precise intervals, we'd create a child thread and open the <code class="literal">statebe</code> socket in that thread. We'd then send irregular state updates to that child thread from our main thread and allow the child thread to conflate them into regular outgoing messages. This is more work than we need here.</p></div><div class="sect2" title="Prototyping the Local and Cloud Flows"><div class="titlepage"><div><div><h3 class="title"><a id="idp19611720"></a>Prototyping the Local and Cloud Flows</h3></div></div></div><p>Let's now prototype at the flow of tasks via the local and cloud sockets<a class="xref" href="ch03s07.html#figure-46" title="Figure 3.21. The Flow of Tasks">Figure 3.21, “The Flow of Tasks”</a>. This code pulls requests from clients and then distributes them to local workers and cloud peers on a random basis.</p><div class="figure"><a id="figure-46"></a><p class="title"><strong>Figure 3.21. The Flow of Tasks</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig46.png" alt="The Flow of Tasks" /></div></div></div><br class="figure-break" /><p>Before we jump into the code, which is getting a little complex, let's sketch the core routing logic and break it down into a simple yet robust design.</p><p>We need two queues, one for requests from local clients and one for requests from cloud clients. One option would be to pull messages off the local and cloud frontends, and pump these onto their respective queues. But this is kind of pointless because ØMQ sockets <span class="emphasis"><em>are</em></span> queues already. So let's use the ØMQ socket buffers as queues.</p><p>This was the technique we used in the load balancing broker, and it worked nicely. We only read from the two frontends when there is somewhere to send the requests. We can always read from the backends, as they give us replies to route back. As long as the backends aren't talking to us, there's no point in even looking at the frontends.</p><p>So our main loop becomes:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Poll the backends for activity. When we get a message, it may be "ready" from a worker or it may be a reply. If it's a reply, route back via the local or cloud frontend.</p></li><li class="listitem"><p>If a worker replied, it became available, so we queue it and count it.</p></li><li class="listitem"><p>While there are workers available, take a request, if any, from either frontend and route to a local worker, or randomly, to a cloud peer.</p></li></ul></div><p>Randomly sending tasks to a peer broker rather than a worker simulates work distribution across the cluster. It's dumb, but that is fine for this stage.</p><p>We use broker identities to route messages between brokers. Each broker has a name that we provide on the command line in this simple prototype. As long as these names don't overlap with the ØMQ-generated UUIDs used for client nodes, we can figure out whether to route a reply back to a client or to a broker.</p><p>Here is how this works in code. The interesting part starts around the comment "Interesting part".</p><div class="example"><a id="peering2-c"></a><p class="title"><strong>Example 3.21. Prototype local and cloud flow (peering2.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Broker peering simulation (part 2)
+//  Prototypes the request-reply flow
+
+#include "czmq.h"
+#define NBR_CLIENTS 10
+#define NBR_WORKERS 3
+#define WORKER_READY   "\001"      //  Signals worker is ready
+
+//  Our own name; in practice this would be configured per node
+static char *self;
+</pre></div></div><br class="example-break" /><p>The client task does a request-reply dialog using a standard synchronous REQ socket: 
+</p><div class="example"><a id="peering2-c-1"></a><p class="title"><strong>Example 3.22. Prototype local and cloud flow (peering2.c) - client task</strong></p><div class="example-contents"><pre class="programlisting">
+
+static void *
+client_task (void *args)
+{
+    zctx_t *ctx = zctx_new ();
+    void *client = zsocket_new (ctx, ZMQ_REQ);
+    zsocket_connect (client, "ipc://%s-localfe.ipc", self);
+
+    while (true) {
+        //  Send request, get reply
+        zstr_send (client, "HELLO");
+        char *reply = zstr_recv (client);
+        if (!reply)
+            break;              //  Interrupted
+        printf ("Client: %s\n", reply);
+        free (reply);
+        sleep (1);
+    }
+    zctx_destroy (&amp;ctx);
+    return NULL;
+}
+</pre></div></div><br class="example-break" /><p>The worker task plugs into the load-balancer using a REQ socket: 
+</p><div class="example"><a id="peering2-c-2"></a><p class="title"><strong>Example 3.23. Prototype local and cloud flow (peering2.c) - worker task</strong></p><div class="example-contents"><pre class="programlisting">
+
+static void *
+worker_task (void *args)
+{
+    zctx_t *ctx = zctx_new ();
+    void *worker = zsocket_new (ctx, ZMQ_REQ);
+    zsocket_connect (worker, "ipc://%s-localbe.ipc", self);
+
+    //  Tell broker we're ready for work
+    zframe_t *frame = zframe_new (WORKER_READY, 1);
+    zframe_send (&amp;frame, worker, 0);
+
+    //  Process messages as they arrive
+    while (true) {
+        zmsg_t *msg = zmsg_recv (worker);
+        if (!msg)
+            break;              //  Interrupted
+
+        zframe_print (zmsg_last (msg), "Worker: ");
+        zframe_reset (zmsg_last (msg), "OK", 2);
+        zmsg_send (&amp;msg, worker);
+    }
+    zctx_destroy (&amp;ctx);
+    return NULL;
+}
+</pre></div></div><br class="example-break" /><p>The main task begins by setting-up its frontend and backend sockets and then starting its client and worker tasks: 
+</p><div class="example"><a id="peering2-c-3"></a><p class="title"><strong>Example 3.24. Prototype local and cloud flow (peering2.c) - main task</strong></p><div class="example-contents"><pre class="programlisting">
+
+int main (int argc, char *argv [])
+{
+    //  First argument is this broker's name
+    //  Other arguments are our peers' names
+    //
+    if (argc &lt; 2) {
+        printf ("syntax: peering2 me {you}...\n");
+        return 0;
+    }
+    self = argv [1];
+    printf ("I: preparing broker at %s...\n", self);
+    srandom ((unsigned) time (NULL));
+
+    zctx_t *ctx = zctx_new ();
+
+    //  Bind cloud frontend to endpoint
+    void *cloudfe = zsocket_new (ctx, ZMQ_ROUTER);
+    zsocket_set_identity (cloudfe, self);
+    zsocket_bind (cloudfe, "ipc://%s-cloud.ipc", self);
+
+    //  Connect cloud backend to all peers
+    void *cloudbe = zsocket_new (ctx, ZMQ_ROUTER);
+    zsocket_set_identity (cloudbe, self);
+    int argn;
+    for (argn = 2; argn &lt; argc; argn++) {
+        char *peer = argv [argn];
+        printf ("I: connecting to cloud frontend at '%s'\n", peer);
+        zsocket_connect (cloudbe, "ipc://%s-cloud.ipc", peer);
+    }
+    //  Prepare local frontend and backend
+    void *localfe = zsocket_new (ctx, ZMQ_ROUTER);
+    zsocket_bind (localfe, "ipc://%s-localfe.ipc", self);
+    void *localbe = zsocket_new (ctx, ZMQ_ROUTER);
+    zsocket_bind (localbe, "ipc://%s-localbe.ipc", self);
+
+    //  Get user to tell us when we can start...
+    printf ("Press Enter when all brokers are started: ");
+    getchar ();
+
+    //  Start local workers
+    int worker_nbr;
+    for (worker_nbr = 0; worker_nbr &lt; NBR_WORKERS; worker_nbr++)
+        zthread_new (worker_task, NULL);
+
+    //  Start local clients
+    int client_nbr;
+    for (client_nbr = 0; client_nbr &lt; NBR_CLIENTS; client_nbr++)
+        zthread_new (client_task, NULL);
+</pre></div></div><br class="example-break" /><p>Here, we handle the request-reply flow. We're using load-balancing to poll workers at all times, and clients only when there are one or more workers available. 
+</p><div class="example"><a id="peering2-c-4"></a><p class="title"><strong>Example 3.25. Prototype local and cloud flow (peering2.c) - request-reply handling</strong></p><div class="example-contents"><pre class="programlisting">
+
+    //  Least recently used queue of available workers
+    int capacity = 0;
+    zlist_t *workers = zlist_new ();
+
+    while (true) {
+        //  First, route any waiting replies from workers
+        zmq_pollitem_t backends [] = {
+            { localbe, 0, ZMQ_POLLIN, 0 },
+            { cloudbe, 0, ZMQ_POLLIN, 0 }
+        };
+        //  If we have no workers, wait indefinitely
+        int rc = zmq_poll (backends, 2,
+            capacity? 1000 * ZMQ_POLL_MSEC: -1);
+        if (rc == -1)
+            break;              //  Interrupted
+
+        //  Handle reply from local worker
+        zmsg_t *msg = NULL;
+        if (backends [0].revents &amp; ZMQ_POLLIN) {
+            msg = zmsg_recv (localbe);
+            if (!msg)
+                break;          //  Interrupted
+            zframe_t *identity = zmsg_unwrap (msg);
+            zlist_append (workers, identity);
+            capacity++;
+
+            //  If it's READY, don't route the message any further
+            zframe_t *frame = zmsg_first (msg);
+            if (memcmp (zframe_data (frame), WORKER_READY, 1) == 0)
+                zmsg_destroy (&amp;msg);
+        }
+        //  Or handle reply from peer broker
+        else
+        if (backends [1].revents &amp; ZMQ_POLLIN) {
+            msg = zmsg_recv (cloudbe);
+            if (!msg)
+                break;          //  Interrupted
+            //  We don't use peer broker identity for anything
+            zframe_t *identity = zmsg_unwrap (msg);
+            zframe_destroy (&amp;identity);
+        }
+        //  Route reply to cloud if it's addressed to a broker
+        for (argn = 2; msg &amp;&amp; argn &lt; argc; argn++) {
+            char *data = (char *) zframe_data (zmsg_first (msg));
+            size_t size = zframe_size (zmsg_first (msg));
+            if (size == strlen (argv [argn])
+            &amp;&amp;  memcmp (data, argv [argn], size) == 0)
+                zmsg_send (&amp;msg, cloudfe);
+        }
+        //  Route reply to client if we still need to
+        if (msg)
+            zmsg_send (&amp;msg, localfe);
+</pre></div></div><br class="example-break" /><p>Now we route as many client requests as we have worker capacity for. We may reroute requests from our local frontend, but not from the cloud frontend. We reroute randomly now, just to test things out. In the next version, we'll do this properly by calculating cloud capacity: 
+</p><div class="example"><a id="peering2-c-5"></a><p class="title"><strong>Example 3.26. Prototype local and cloud flow (peering2.c) - route client requests</strong></p><div class="example-contents"><pre class="programlisting">
+
+        while (capacity) {
+            zmq_pollitem_t frontends [] = {
+                { localfe, 0, ZMQ_POLLIN, 0 },
+                { cloudfe, 0, ZMQ_POLLIN, 0 }
+            };
+            rc = zmq_poll (frontends, 2, 0);
+            assert (rc &gt;= 0);
+            int reroutable = 0;
+            //  We'll do peer brokers first, to prevent starvation
+            if (frontends [1].revents &amp; ZMQ_POLLIN) {
+                msg = zmsg_recv (cloudfe);
+                reroutable = 0;
+            }
+            else
+            if (frontends [0].revents &amp; ZMQ_POLLIN) {
+                msg = zmsg_recv (localfe);
+                reroutable = 1;
+            }
+            else
+                break;      //  No work, go back to backends
+
+            //  If reroutable, send to cloud 20% of the time
+            //  Here we'd normally use cloud status information
+            //
+            if (reroutable &amp;&amp; argc &gt; 2 &amp;&amp; randof (5) == 0) {
+                //  Route to random broker peer
+                int peer = randof (argc - 2) + 2;
+                zmsg_pushmem (msg, argv [peer], strlen (argv [peer]));
+                zmsg_send (&amp;msg, cloudbe);
+            }
+            else {
+                zframe_t *frame = (zframe_t *) zlist_pop (workers);
+                zmsg_wrap (msg, frame);
+                zmsg_send (&amp;msg, localbe);
+                capacity--;
+            }
+        }
+    }
+    //  When we're done, clean up properly
+    while (zlist_size (workers)) {
+        zframe_t *frame = (zframe_t *) zlist_pop (workers);
+        zframe_destroy (&amp;frame);
+    }
+    zlist_destroy (&amp;workers);
+    zctx_destroy (&amp;ctx);
+    return EXIT_SUCCESS;
+}
+</pre></div></div><br class="example-break" /><p>Run this by, for instance, starting two instances of the broker in two windows:</p><pre class="screen">peering2 me you
+peering2 you me
+</pre><p>Some comments on this code:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>In the C code at least, using the zmsg class makes life much easier, and our code much shorter. It's obviously an abstraction that works. If you build ØMQ applications in C, you should use CZMQ.</p></li><li class="listitem"><p>Because we're not getting any state information from peers, we naively assume they are running. The code prompts you to confirm when you've started all the brokers. In the real case, we'd not send anything to brokers who had not told us they exist.</p></li></ul></div><p>You can satisfy yourself that the code works by watching it run forever. If there were any misrouted messages, clients would end up blocking, and the brokers would stop printing trace information. You can prove that by killing either of the brokers. The other broker tries to send requests to the cloud, and one-by-one its clients block, waiting for an answer.</p></div><div class="sect2" title="Putting it All Together"><div class="titlepage"><div><div><h3 class="title"><a id="idp19641400"></a>Putting it All Together</h3></div></div></div><p>Let's put this together into a single package. As before, we'll run an entire cluster as one process. We're going to take the two previous examples and merge them into one properly working design that lets you simulate any number of clusters.</p><p>This code is the size of both previous prototypes together, at 270 LoC. That's pretty good for a simulation of a cluster that includes clients and workers and cloud workload distribution. Here is the code:</p><div class="example"><a id="peering3-c"></a><p class="title"><strong>Example 3.27. Full cluster simulation (peering3.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Broker peering simulation (part 3)
+//  Prototypes the full flow of status and tasks
+
+#include "czmq.h"
+#define NBR_CLIENTS 10
+#define NBR_WORKERS 5
+#define WORKER_READY   "\001"      //  Signals worker is ready
+
+//  Our own name; in practice, this would be configured per node
+static char *self;
+</pre></div></div><br class="example-break" /><p>This is the client task. It issues a burst of requests and then sleeps for a few seconds. This simulates sporadic activity; when a number of clients are active at once, the local workers should be overloaded. The client uses a REQ socket for requests and also pushes statistics to the monitor socket: 
+</p><div class="example"><a id="peering3-c-1"></a><p class="title"><strong>Example 3.28. Full cluster simulation (peering3.c) - client task</strong></p><div class="example-contents"><pre class="programlisting">
+
+static void *
+client_task (void *args)
+{
+    zctx_t *ctx = zctx_new ();
+    void *client = zsocket_new (ctx, ZMQ_REQ);
+    zsocket_connect (client, "ipc://%s-localfe.ipc", self);
+    void *monitor = zsocket_new (ctx, ZMQ_PUSH);
+    zsocket_connect (monitor, "ipc://%s-monitor.ipc", self);
+
+    while (true) {
+        sleep (randof (5));
+        int burst = randof (15);
+        while (burst--) {
+            char task_id [5];
+            sprintf (task_id, "%04X", randof (0x10000));
+
+            //  Send request with random hex ID
+            zstr_send (client, task_id);
+
+            //  Wait max ten seconds for a reply, then complain
+            zmq_pollitem_t pollset [1] = { { client, 0, ZMQ_POLLIN, 0 } };
+            int rc = zmq_poll (pollset, 1, 10 * 1000 * ZMQ_POLL_MSEC);
+            if (rc == -1)
+                break;          //  Interrupted
+
+            if (pollset [0].revents &amp; ZMQ_POLLIN) {
+                char *reply = zstr_recv (client);
+                if (!reply)
+                    break;              //  Interrupted
+                //  Worker is supposed to answer us with our task id
+                assert (streq (reply, task_id));
+                zstr_send (monitor, "%s", reply);
+                free (reply);
+            }
+            else {
+                zstr_send (monitor,
+                    "E: CLIENT EXIT - lost task %s", task_id);
+                return NULL;
+            }
+        }
+    }
+    zctx_destroy (&amp;ctx);
+    return NULL;
+}
+</pre></div></div><br class="example-break" /><p>This is the worker task, which uses a REQ socket to plug into the load-balancer. It's the same stub worker task that you've seen in other examples: 
+</p><div class="example"><a id="peering3-c-2"></a><p class="title"><strong>Example 3.29. Full cluster simulation (peering3.c) - worker task</strong></p><div class="example-contents"><pre class="programlisting">
+
+static void *
+worker_task (void *args)
+{
+    zctx_t *ctx = zctx_new ();
+    void *worker = zsocket_new (ctx, ZMQ_REQ);
+    zsocket_connect (worker, "ipc://%s-localbe.ipc", self);
+
+    //  Tell broker we're ready for work
+    zframe_t *frame = zframe_new (WORKER_READY, 1);
+    zframe_send (&amp;frame, worker, 0);
+
+    //  Process messages as they arrive
+    while (true) {
+        zmsg_t *msg = zmsg_recv (worker);
+        if (!msg)
+            break;              //  Interrupted
+
+        //  Workers are busy for 0/1 seconds
+        sleep (randof (2));
+        zmsg_send (&amp;msg, worker);
+    }
+    zctx_destroy (&amp;ctx);
+    return NULL;
+}
+</pre></div></div><br class="example-break" /><p>The main task begins by setting up all its sockets. The local frontend talks to clients, and our local backend talks to workers. The cloud frontend talks to peer brokers as if they were clients, and the cloud backend talks to peer brokers as if they were workers. The state backend publishes regular state messages, and the state frontend subscribes to all state backends to collect these messages. Finally, we use a PULL monitor socket to collect printable messages from tasks: 
+</p><div class="example"><a id="peering3-c-3"></a><p class="title"><strong>Example 3.30. Full cluster simulation (peering3.c) - main task</strong></p><div class="example-contents"><pre class="programlisting">
+
+int main (int argc, char *argv [])
+{
+    //  First argument is this broker's name
+    //  Other arguments are our peers' names
+    if (argc &lt; 2) {
+        printf ("syntax: peering3 me {you}...\n");
+        return 0;
+    }
+    self = argv [1];
+    printf ("I: preparing broker at %s...\n", self);
+    srandom ((unsigned) time (NULL));
+
+    //  Prepare local frontend and backend
+    zctx_t *ctx = zctx_new ();
+    void *localfe = zsocket_new (ctx, ZMQ_ROUTER);
+    zsocket_bind (localfe, "ipc://%s-localfe.ipc", self);
+
+    void *localbe = zsocket_new (ctx, ZMQ_ROUTER);
+    zsocket_bind (localbe, "ipc://%s-localbe.ipc", self);
+
+    //  Bind cloud frontend to endpoint
+    void *cloudfe = zsocket_new (ctx, ZMQ_ROUTER);
+    zsocket_set_identity (cloudfe, self);
+    zsocket_bind (cloudfe, "ipc://%s-cloud.ipc", self);
+    
+    //  Connect cloud backend to all peers
+    void *cloudbe = zsocket_new (ctx, ZMQ_ROUTER);
+    zsocket_set_identity (cloudbe, self);
+    int argn;
+    for (argn = 2; argn &lt; argc; argn++) {
+        char *peer = argv [argn];
+        printf ("I: connecting to cloud frontend at '%s'\n", peer);
+        zsocket_connect (cloudbe, "ipc://%s-cloud.ipc", peer);
+    }
+    //  Bind state backend to endpoint
+    void *statebe = zsocket_new (ctx, ZMQ_PUB);
+    zsocket_bind (statebe, "ipc://%s-state.ipc", self);
+
+    //  Connect state frontend to all peers
+    void *statefe = zsocket_new (ctx, ZMQ_SUB);
+    zsocket_set_subscribe (statefe, "");
+    for (argn = 2; argn &lt; argc; argn++) {
+        char *peer = argv [argn];
+        printf ("I: connecting to state backend at '%s'\n", peer);
+        zsocket_connect (statefe, "ipc://%s-state.ipc", peer);
+    }
+    //  Prepare monitor socket
+    void *monitor = zsocket_new (ctx, ZMQ_PULL);
+    zsocket_bind (monitor, "ipc://%s-monitor.ipc", self);
+</pre></div></div><br class="example-break" /><p>After binding and connecting all our sockets, we start our child tasks - workers and clients: 
+</p><div class="example"><a id="peering3-c-4"></a><p class="title"><strong>Example 3.31. Full cluster simulation (peering3.c) - start child tasks</strong></p><div class="example-contents"><pre class="programlisting">
+
+    int worker_nbr;
+    for (worker_nbr = 0; worker_nbr &lt; NBR_WORKERS; worker_nbr++)
+        zthread_new (worker_task, NULL);
+
+    //  Start local clients
+    int client_nbr;
+    for (client_nbr = 0; client_nbr &lt; NBR_CLIENTS; client_nbr++)
+        zthread_new (client_task, NULL);
+
+    //  Queue of available workers
+    int local_capacity = 0;
+    int cloud_capacity = 0;
+    zlist_t *workers = zlist_new ();
+</pre></div></div><br class="example-break" /><p>The main loop has two parts. First, we poll workers and our two service sockets (statefe and monitor), in any case. If we have no ready workers, then there's no point in looking at incoming requests. These can remain on their internal ØMQ queues: 
+</p><div class="example"><a id="peering3-c-5"></a><p class="title"><strong>Example 3.32. Full cluster simulation (peering3.c) - main loop</strong></p><div class="example-contents"><pre class="programlisting">
+
+    while (true) {
+        zmq_pollitem_t primary [] = {
+            { localbe, 0, ZMQ_POLLIN, 0 },
+            { cloudbe, 0, ZMQ_POLLIN, 0 },
+            { statefe, 0, ZMQ_POLLIN, 0 },
+            { monitor, 0, ZMQ_POLLIN, 0 }
+        };
+        //  If we have no workers ready, wait indefinitely
+        int rc = zmq_poll (primary, 4,
+            local_capacity? 1000 * ZMQ_POLL_MSEC: -1);
+        if (rc == -1)
+            break;              //  Interrupted
+
+        //  Track if capacity changes during this iteration
+        int previous = local_capacity;
+        zmsg_t *msg = NULL;     //  Reply from local worker
+
+        if (primary [0].revents &amp; ZMQ_POLLIN) {
+            msg = zmsg_recv (localbe);
+            if (!msg)
+                break;          //  Interrupted
+            zframe_t *identity = zmsg_unwrap (msg);
+            zlist_append (workers, identity);
+            local_capacity++;
+
+            //  If it's READY, don't route the message any further
+            zframe_t *frame = zmsg_first (msg);
+            if (memcmp (zframe_data (frame), WORKER_READY, 1) == 0)
+                zmsg_destroy (&amp;msg);
+        }
+        //  Or handle reply from peer broker
+        else
+        if (primary [1].revents &amp; ZMQ_POLLIN) {
+            msg = zmsg_recv (cloudbe);
+            if (!msg)
+                break;          //  Interrupted
+            //  We don't use peer broker identity for anything
+            zframe_t *identity = zmsg_unwrap (msg);
+            zframe_destroy (&amp;identity);
+        }
+        //  Route reply to cloud if it's addressed to a broker
+        for (argn = 2; msg &amp;&amp; argn &lt; argc; argn++) {
+            char *data = (char *) zframe_data (zmsg_first (msg));
+            size_t size = zframe_size (zmsg_first (msg));
+            if (size == strlen (argv [argn])
+            &amp;&amp;  memcmp (data, argv [argn], size) == 0)
+                zmsg_send (&amp;msg, cloudfe);
+        }
+        //  Route reply to client if we still need to
+        if (msg)
+            zmsg_send (&amp;msg, localfe);
+</pre></div></div><br class="example-break" /><p>If we have input messages on our statefe or monitor sockets, we can process these immediately: 
+</p><div class="example"><a id="peering3-c-6"></a><p class="title"><strong>Example 3.33. Full cluster simulation (peering3.c) - handle state messages</strong></p><div class="example-contents"><pre class="programlisting">
+
+        if (primary [2].revents &amp; ZMQ_POLLIN) {
+            char *peer = zstr_recv (statefe);
+            char *status = zstr_recv (statefe);
+            cloud_capacity = atoi (status);
+            free (peer);
+            free (status);
+        }
+        if (primary [3].revents &amp; ZMQ_POLLIN) {
+            char *status = zstr_recv (monitor);
+            printf ("%s\n", status);
+            free (status);
+        }
+</pre></div></div><br class="example-break" /><p>Now route as many clients requests as we can handle. If we have local capacity, we poll both localfe and cloudfe. If we have cloud capacity only, we poll just localfe. We route any request locally if we can, else we route to the cloud. 
+</p><div class="example"><a id="peering3-c-7"></a><p class="title"><strong>Example 3.34. Full cluster simulation (peering3.c) - route client requests</strong></p><div class="example-contents"><pre class="programlisting">
+        while (local_capacity + cloud_capacity) {
+            zmq_pollitem_t secondary [] = {
+                { localfe, 0, ZMQ_POLLIN, 0 },
+                { cloudfe, 0, ZMQ_POLLIN, 0 }
+            };
+            if (local_capacity)
+                rc = zmq_poll (secondary, 2, 0);
+            else
+                rc = zmq_poll (secondary, 1, 0);
+            assert (rc &gt;= 0);
+
+            if (secondary [0].revents &amp; ZMQ_POLLIN)
+                msg = zmsg_recv (localfe);
+            else
+            if (secondary [1].revents &amp; ZMQ_POLLIN)
+                msg = zmsg_recv (cloudfe);
+            else
+                break;      //  No work, go back to primary
+
+            if (local_capacity) {
+                zframe_t *frame = (zframe_t *) zlist_pop (workers);
+                zmsg_wrap (msg, frame);
+                zmsg_send (&amp;msg, localbe);
+                local_capacity--;
+            }
+            else {
+                //  Route to random broker peer
+                int peer = randof (argc - 2) + 2;
+                zmsg_pushmem (msg, argv [peer], strlen (argv [peer]));
+                zmsg_send (&amp;msg, cloudbe);
+            }
+        }
+</pre></div></div><br class="example-break" /><p>We broadcast capacity messages to other peers; to reduce chatter, we do this only if our capacity changed. 
+</p><div class="example"><a id="peering3-c-8"></a><p class="title"><strong>Example 3.35. Full cluster simulation (peering3.c) - broadcast capacity</strong></p><div class="example-contents"><pre class="programlisting">
+        if (local_capacity != previous) {
+            //  We stick our own identity onto the envelope
+            zstr_sendm (statebe, self);
+            //  Broadcast new capacity
+            zstr_send (statebe, "%d", local_capacity);
+        }
+    }
+    //  When we're done, clean up properly
+    while (zlist_size (workers)) {
+        zframe_t *frame = (zframe_t *) zlist_pop (workers);
+        zframe_destroy (&amp;frame);
+    }
+    zlist_destroy (&amp;workers);
+    zctx_destroy (&amp;ctx);
+    return EXIT_SUCCESS;
+}
+</pre></div></div><br class="example-break" /><p>It's a nontrivial program and took about a day to get working. These are the highlights:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The client threads detect and report a failed request. They do this by polling for a response and if none arrives after a while (10 seconds), printing an error message.</p></li><li class="listitem"><p>Client threads don't print directly, but instead send a message to a monitor socket (PUSH) that the main loop collects (PULL) and prints off. This is the first case we've seen of using ØMQ sockets for monitoring and logging; this is a big use case that we'll come back to later.</p></li><li class="listitem"><p>Clients simulate varying loads to get the cluster 100% at random moments, so that tasks are shifted over to the cloud. The number of clients and workers, and delays in the client and worker threads control this. Feel free to play with them to see if you can make a more realistic simulation.</p></li><li class="listitem"><p>The main loop uses two pollsets. It could in fact use three: information, backends, and frontends. As in the earlier prototype, there is no point in taking a frontend message if there is no backend capacity.</p></li></ul></div><p>These are some of the problems that arose during development of this program:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Clients would freeze, due to requests or replies getting lost somewhere. Recall that the ROUTER socket drops messages it can't route. The first tactic here was to modify the client thread to detect and report such problems. Secondly, I put <code class="literal">zmsg_dump()</code> calls after every receive and before every send in the main loop, until the origin of the problems was clear.</p></li><li class="listitem"><p>The main loop was mistakenly reading from more than one ready socket. This caused the first message to be lost. I fixed that by reading only from the first ready socket.</p></li><li class="listitem"><p>The <code class="literal">zmsg</code> class was not properly encoding UUIDs as C strings. This caused UUIDs that contain 0 bytes to be corrupted. I fixed that by modifying <code class="literal">zmsg</code> to encode UUIDs as printable hex strings.</p></li></ul></div><p>This simulation does not detect disappearance of a cloud peer. If you start several peers and stop one, and it was broadcasting capacity to the others, they will continue to send it work even if it's gone. You can try this, and you will get clients that complain of lost requests. The solution is twofold: first, only keep the capacity information for a short time so that if a peer does disappear, its capacity is quickly set to zero. Second, add reliability to the request-reply chain. We'll look at reliability in the next chapter.</p></div></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch03s06.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch03.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch04.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">The Asynchronous Client/Server Pattern </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Chapter 4. Reliable Request-Reply Patterns</td></tr></table></div></body></html>

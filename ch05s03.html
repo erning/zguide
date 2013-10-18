@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Last Value Caching</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch05.html" title="Chapter 5. Advanced Pub-Sub Patterns" /><link rel="prev" href="ch05s02.html" title="Pub-Sub Tracing (Espresso Pattern)" /><link rel="next" href="ch05s04.html" title="Slow Subscriber Detection (Suicidal Snail Pattern)" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Last Value Caching</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch05s02.html">Prev</a> </td><th width="60%" align="center">Chapter 5. Advanced Pub-Sub Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch05s04.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Last Value Caching"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp20188624"></a>Last Value Caching</h2></div></div></div><p>If you've used commercial pub-sub systems, you may be used to some features that are missing in the fast and cheerful ØMQ pub-sub model. One of these is <span class="emphasis"><em>last value caching</em></span> (LVC). This solves the problem of how a new subscriber catches up when it joins the network. The theory is that publishers get notified when a new subscriber joins and subscribes to some specific topics. The publisher can then rebroadcast the last message for those topics.</p><p>I've already explained why publishers don't get notified when there are new subscribers, because in large pub-sub systems, the volumes of data make it pretty much impossible. To make really large-scale pub-sub networks, you need a protocol like PGM that exploits an upscale Ethernet switch's ability to multicast data to thousands of subscribers. Trying to do a TCP unicast from the publisher to each of thousands of subscribers just doesn't scale. You get weird spikes, unfair distribution (some subscribers getting the message before others), network congestion, and general unhappiness.</p><p>PGM is a one-way protocol: the publisher sends a message to a multicast address at the switch, which then rebroadcasts that to all interested subscribers. The publisher never sees when subscribers join or leave: this all happens in the switch, which we don't really want to start reprogramming.</p><p>However, in a lower-volume network with a few dozen subscribers and a limited number of topics, we can use TCP and then the XSUB and XPUB sockets <span class="emphasis"><em>do</em></span> talk to each other as we just saw in the Espresso pattern.</p><p>Can we make an LVC using ØMQ? The answer is yes, if we make a proxy that sits between the publisher and subscribers; an analog for the PGM switch, but one we can program ourselves.</p><p>I'll start by making a publisher and subscriber that highlight the worst case scenario. This publisher is pathological. It starts by immediately sending messages to each of a thousand topics, and then it sends one update a second to a random topic. A subscriber connects, and subscribes to a topic. Without LVC, a subscriber would have to wait an average of 500 seconds to get any data. To add some drama, let's pretend there's an escaped convict called Gregor threatening to rip the head off Roger the toy bunny if we can't fix that 8.3 minutes' delay.</p><p>Here's the publisher code. Note that it has the command line option to connect to some address, but otherwise binds to an endpoint. We'll use this later to connect to our last value cache:</p><div class="example"><a id="pathopub-c"></a><p class="title"><strong>Example 5.5. Pathologic Publisher (pathopub.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Pathological publisher
+//  Sends out 1,000 topics and then one random update per second
+
+#include "czmq.h"
+
+int main (int argc, char *argv [])
+{
+    zctx_t *context = zctx_new ();
+    void *publisher = zsocket_new (context, ZMQ_PUB);
+    if (argc == 2)
+        zsocket_connect (publisher, argv [1]);
+    else
+        zsocket_bind (publisher, "tcp://*:5556");
+
+    //  Ensure subscriber connection has time to complete
+    sleep (1);
+
+    //  Send out all 1,000 topic messages
+    int topic_nbr;
+    for (topic_nbr = 0; topic_nbr &lt; 1000; topic_nbr++) {
+        zstr_sendm (publisher, "%03d", topic_nbr);
+        zstr_send (publisher, "Save Roger");
+    }
+    //  Send one random update per second
+    srandom ((unsigned) time (NULL));
+    while (!zctx_interrupted) {
+        sleep (1);
+        zstr_sendm (publisher, "%03d", randof (1000));
+        zstr_send (publisher, "Off with his head!");
+    }
+    zctx_destroy (&amp;context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>And here's the subscriber:</p><div class="example"><a id="pathosub-c"></a><p class="title"><strong>Example 5.6. Pathologic Subscriber (pathosub.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Pathological subscriber
+//  Subscribes to one random topic and prints received messages
+
+#include "czmq.h"
+
+int main (int argc, char *argv [])
+{
+    zctx_t *context = zctx_new ();
+    void *subscriber = zsocket_new (context, ZMQ_SUB);
+    if (argc == 2)
+        zsocket_connect (subscriber, argv [1]);
+    else
+        zsocket_connect (subscriber, "tcp://localhost:5556");
+
+    srandom ((unsigned) time (NULL));
+    char subscription [5];
+    sprintf (subscription, "%03d", randof (1000));
+    zsocket_set_subscribe (subscriber, subscription);
+    
+    while (true) {
+        char *topic = zstr_recv (subscriber);
+        if (!topic)
+            break;
+        char *data = zstr_recv (subscriber);
+        assert (streq (topic, subscription));
+        puts (data);
+        free (topic);
+        free (data);
+    }
+    zctx_destroy (&amp;context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>Try building and running these: first the subscriber, then the publisher. You'll see the subscriber reports getting "Save Roger" as you'd expect:</p><pre class="screen">./pathosub &amp;
+./pathopub
+</pre><p>It's when you run a second subscriber that you understand Roger's predicament. You have to leave it an awful long time before it reports getting any data. So, here's our last value cache. As I promised, it's a proxy that binds to two sockets and then handles messages on both:</p><div class="example"><a id="lvcache-c"></a><p class="title"><strong>Example 5.7. Last Value Caching Proxy (lvcache.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Last value cache
+//  Uses XPUB subscription messages to re-send data
+
+#include "czmq.h"
+
+int main (void)
+{
+    zctx_t *context = zctx_new ();
+    void *frontend = zsocket_new (context, ZMQ_SUB);
+    zsocket_bind (frontend, "tcp://*:5557");
+    void *backend = zsocket_new (context, ZMQ_XPUB);
+    zsocket_bind (backend, "tcp://*:5558");
+
+    //  Subscribe to every single topic from publisher
+    zsocket_set_subscribe (frontend, "");
+
+    //  Store last instance of each topic in a cache
+    zhash_t *cache = zhash_new ();
+</pre></div></div><br class="example-break" /><p>We route topic updates from frontend to backend, and we handle subscriptions by sending whatever we cached, if anything: 
+</p><div class="example"><a id="lvcache-c-1"></a><p class="title"><strong>Example 5.8. Last Value Caching Proxy (lvcache.c) - main poll loop</strong></p><div class="example-contents"><pre class="programlisting">
+
+        zmq_pollitem_t items [] = {
+            { frontend, 0, ZMQ_POLLIN, 0 },
+            { backend,  0, ZMQ_POLLIN, 0 }
+        };
+        if (zmq_poll (items, 2, 1000 * ZMQ_POLL_MSEC) == -1)
+            break;              //  Interrupted
+
+        //  Any new topic data we cache and then forward
+        if (items [0].revents &amp; ZMQ_POLLIN) {
+            char *topic = zstr_recv (frontend);
+            char *current = zstr_recv (frontend);
+            if (!topic)
+                break;
+            char *previous = zhash_lookup (cache, topic);
+            if (previous) {
+                zhash_delete (cache, topic);
+                free (previous);
+            }
+            zhash_insert (cache, topic, current);
+            zstr_sendm (backend, topic);
+            zstr_send (backend, current);
+            free (topic);
+        }
+</pre></div></div><br class="example-break" /><p>When we get a new subscription, we pull data from the cache: 
+</p><div class="example"><a id="lvcache-c-2"></a><p class="title"><strong>Example 5.9. Last Value Caching Proxy (lvcache.c) - handle subscriptions</strong></p><div class="example-contents"><pre class="programlisting">
+            zframe_t *frame = zframe_recv (backend);
+            if (!frame)
+                break;
+            //  Event is one byte 0=unsub or 1=sub, followed by topic
+            byte *event = zframe_data (frame);
+            if (event [0] == 1) {
+                char *topic = zmalloc (zframe_size (frame));
+                memcpy (topic, event + 1, zframe_size (frame) - 1);
+                printf ("Sending cached topic %s\n", topic);
+                char *previous = zhash_lookup (cache, topic);
+                if (previous) {
+                    zstr_sendm (backend, topic);
+                    zstr_send (backend, previous);
+                }
+                free (topic);
+            }
+            zframe_destroy (&amp;frame);
+        }
+    }
+    zctx_destroy (&amp;context);
+    zhash_destroy (&amp;cache);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>Now, run the proxy, and then the publisher:</p><pre class="screen">./lvcache &amp;
+./pathopub tcp://localhost:5557
+</pre><p>And now run as many instances of the subscriber as you want to try, each time connecting to the proxy on port 5558:</p><pre class="screen">./pathosub tcp://localhost:5558
+</pre><p>Each subscriber happily reports "Save Roger", and Gregor the Escaped Convict slinks back to his seat for dinner and a nice cup of hot milk, which is all he really wanted in the first place.</p><p>One note: by default, the XPUB socket does not report duplicate subscriptions, which is what you want when you're naively connecting an XPUB to an XSUB. Our example sneakily gets around this by using random topics so the chance of it not working is one in a million. In a real LVC proxy, you'll want to use the <code class="literal">ZMQ_XPUB_VERBOSE</code> option that we implement in The ØMQ Community<a class="xref" href="ch06.html" title="Chapter 6. The ØMQ Community">Chapter 6, <em>The ØMQ Community</em></a> as an exercise.</p></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch05s02.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch05.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch05s04.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Pub-Sub Tracing (Espresso Pattern) </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Slow Subscriber Detection (Suicidal Snail Pattern)</td></tr></table></div></body></html>

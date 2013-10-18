@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Example Zyre Application</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch08.html" title="Chapter 8. A Framework for Distributed Computing" /><link rel="prev" href="ch08s10.html" title="Writing the Unprotocol" /><link rel="next" href="ch08s12.html" title="Conclusions" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Example Zyre Application</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch08s10.html">Prev</a> </td><th width="60%" align="center">Chapter 8. A Framework for Distributed Computing</th><td width="20%" align="right"> <a accesskey="n" href="ch08s12.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Example Zyre Application"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp21493480"></a>Example Zyre Application</h2></div></div></div><p>Let's now make a minimal example that uses Zyre to broadcast files around a distributed network. This example consists of two programs:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>A <span class="emphasis"><em>listener</em></span> that joins the Zyre network and reports whenever it receives a file.</p></li><li class="listitem"><p>A <span class="emphasis"><em>sender</em></span> that joins a Zyre network and broadcasts exactly one file.</p></li></ul></div><p>The listener is quite short:</p><pre class="programlisting">
+#include &lt;zre.h&gt;
+
+int main (int argc, char *argv [])
+{
+    zre_interface_t *interface = zre_interface_new ();
+    while (true) {
+        zmsg_t *incoming = zre_interface_recv (interface);
+        if (!incoming)
+            break;
+        zmsg_dump (incoming);
+        zmsg_destroy (&amp;incoming);
+    }
+    zre_interface_destroy (&amp;interface);
+    return 0;
+}
+</pre><p>And the sender isn't much longer:</p><pre class="programlisting">
+#include &lt;zre.h&gt;
+
+int main (int argc, char *argv [])
+{
+    if (argc &lt; 2) {
+        puts ("Syntax: sender filename virtualname");
+        return 0;
+    }
+    printf ("Publishing %s as %s\n", argv [1], argv [2]);
+    zre_interface_t *interface = zre_interface_new ();
+    zre_interface_publish (interface, argv [1], argv [2]);
+    while (true) {
+        zmsg_t *incoming = zre_interface_recv (interface);
+        if (!incoming)
+            break;
+        zmsg_dump (incoming);
+        zmsg_destroy (&amp;incoming);
+    }
+    zre_interface_destroy (&amp;interface);
+    return 0;
+}
+</pre></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch08s10.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch08.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch08s12.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Writing the Unprotocol </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Conclusions</td></tr></table></div></body></html>

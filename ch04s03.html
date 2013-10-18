@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Client-Side Reliability (Lazy Pirate Pattern)</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch04.html" title="Chapter 4. Reliable Request-Reply Patterns" /><link rel="prev" href="ch04s02.html" title="Designing Reliability" /><link rel="next" href="ch04s04.html" title="Basic Reliable Queuing (Simple Pirate Pattern)" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Client-Side Reliability (Lazy Pirate Pattern)</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch04s02.html">Prev</a> </td><th width="60%" align="center">Chapter 4. Reliable Request-Reply Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch04s04.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Client-Side Reliability (Lazy Pirate Pattern)"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp19693248"></a>Client-Side Reliability (Lazy Pirate Pattern)</h2></div></div></div><p>We can get very simple reliable request-reply with some changes to the client. We call this the Lazy Pirate pattern<a class="xref" href="ch04s03.html#figure-47" title="Figure 4.1. The Lazy Pirate Pattern">Figure 4.1, “The Lazy Pirate Pattern”</a>. Rather than doing a blocking receive, we:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Poll the REQ socket and receive from it only when it's sure a reply has arrived.</p></li><li class="listitem"><p>Resend a request, if no reply has arrived within a timeout period.</p></li><li class="listitem"><p>Abandon the transaction if there is still no reply after several requests.</p></li></ul></div><p>If you try to use a REQ socket in anything other than a strict send/receive fashion, you'll get an error (technically, the REQ socket implements a small finite-state machine to enforce the send/receive ping-pong, and so the error code is called "EFSM"). This is slightly annoying when we want to use REQ in a pirate pattern, because we may send several requests before getting a reply.</p><p>The pretty good brute force solution is to close and reopen the REQ socket after an error:</p><div class="example"><a id="lpclient-c"></a><p class="title"><strong>Example 4.1. Lazy Pirate client (lpclient.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Lazy Pirate client
+//  Use zmq_poll to do a safe request-reply
+//  To run, start lpserver and then randomly kill/restart it
+
+#include "czmq.h"
+#define REQUEST_TIMEOUT     2500    //  msecs, (&gt; 1000!)
+#define REQUEST_RETRIES     3       //  Before we abandon
+#define SERVER_ENDPOINT     "tcp://localhost:5555"
+
+int main (void)
+{
+    zctx_t *ctx = zctx_new ();
+    printf ("I: connecting to server...\n");
+    void *client = zsocket_new (ctx, ZMQ_REQ);
+    assert (client);
+    zsocket_connect (client, SERVER_ENDPOINT);
+
+    int sequence = 0;
+    int retries_left = REQUEST_RETRIES;
+    while (retries_left &amp;&amp; !zctx_interrupted) {
+        //  We send a request, then we work to get a reply
+        char request [10];
+        sprintf (request, "%d", ++sequence);
+        zstr_send (client, request);
+
+        int expect_reply = 1;
+        while (expect_reply) {
+            //  Poll socket for a reply, with timeout
+            zmq_pollitem_t items [] = { { client, 0, ZMQ_POLLIN, 0 } };
+            int rc = zmq_poll (items, 1, REQUEST_TIMEOUT * ZMQ_POLL_MSEC);
+            if (rc == -1)
+                break;          //  Interrupted
+</pre></div></div><br class="example-break" /><p>Here we process a server reply and exit our loop if the reply is valid. If we didn't a reply we close the client socket and resend the request. We try a number of times before finally abandoning: 
+</p><div class="example"><a id="lpclient-c-1"></a><p class="title"><strong>Example 4.2. Lazy Pirate client (lpclient.c) - process server reply</strong></p><div class="example-contents"><pre class="programlisting">
+
+            if (items [0].revents &amp; ZMQ_POLLIN) {
+                //  We got a reply from the server, must match sequence
+                char *reply = zstr_recv (client);
+                if (!reply)
+                    break;      //  Interrupted
+                if (atoi (reply) == sequence) {
+                    printf ("I: server replied OK (%s)\n", reply);
+                    retries_left = REQUEST_RETRIES;
+                    expect_reply = 0;
+                }
+                else
+                    printf ("E: malformed reply from server: %s\n",
+                        reply);
+
+                free (reply);
+            }
+            else
+            if (--retries_left == 0) {
+                printf ("E: server seems to be offline, abandoning\n");
+                break;
+            }
+            else {
+                printf ("W: no response from server, retrying...\n");
+                //  Old socket is confused; close it and open a new one
+                zsocket_destroy (ctx, client);
+                printf ("I: reconnecting to server...\n");
+                client = zsocket_new (ctx, ZMQ_REQ);
+                zsocket_connect (client, SERVER_ENDPOINT);
+                //  Send request again, on new socket
+                zstr_send (client, request);
+            }
+        }
+    }
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>Run this together with the matching server:</p><div class="example"><a id="lpserver-c"></a><p class="title"><strong>Example 4.3. Lazy Pirate server (lpserver.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Lazy Pirate server
+//  Binds REQ socket to tcp://*:5555
+//  Like hwserver except:
+//   - echoes request as-is
+//   - randomly runs slowly, or exits to simulate a crash.
+
+#include "zhelpers.h"
+
+int main (void)
+{
+    srandom ((unsigned) time (NULL));
+
+    void *context = zmq_ctx_new ();
+    void *server = zmq_socket (context, ZMQ_REP);
+    zmq_bind (server, "tcp://*:5555");
+
+    int cycles = 0;
+    while (1) {
+        char *request = s_recv (server);
+        cycles++;
+
+        //  Simulate various problems, after a few cycles
+        if (cycles &gt; 3 &amp;&amp; randof (3) == 0) {
+            printf ("I: simulating a crash\n");
+            break;
+        }
+        else
+        if (cycles &gt; 3 &amp;&amp; randof (3) == 0) {
+            printf ("I: simulating CPU overload\n");
+            sleep (2);
+        }
+        printf ("I: normal request (%s)\n", request);
+        sleep (1);              //  Do some heavy work
+        s_send (server, request);
+        free (request);
+    }
+    zmq_close (server);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><div class="figure"><a id="figure-47"></a><p class="title"><strong>Figure 4.1. The Lazy Pirate Pattern</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig47.png" alt="The Lazy Pirate Pattern" /></div></div></div><br class="figure-break" /><p>To run this test case, start the client and the server in two console windows. The server will randomly misbehave after a few messages. You can check the client's response. Here is typical output from the server:</p><pre class="screen">I: normal request (1)
+I: normal request (2)
+I: normal request (3)
+I: simulating CPU overload
+I: normal request (4)
+I: simulating a crash
+</pre><p>And here is the client's response:</p><pre class="screen">I: connecting to server...
+I: server replied OK (1)
+I: server replied OK (2)
+I: server replied OK (3)
+W: no response from server, retrying...
+I: connecting to server...
+W: no response from server, retrying...
+I: connecting to server...
+E: server seems to be offline, abandoning
+</pre><p>The client sequences each message and checks that replies come back exactly in order: that no requests or replies are lost, and no replies come back more than once, or out of order. Run the test a few times until you're convinced that this mechanism actually works. You don't need sequence numbers in a production application; they just help us trust our design.</p><p>The client uses a REQ socket, and does the brute force close/reopen because REQ sockets impose that strict send/receive cycle. You might be tempted to use a DEALER instead, but it would not be a good decision. First, it would mean emulating the secret sauce that REQ does with envelopes (if you've forgotten what that is, it's a good sign you don't want to have to do it). Second, it would mean potentially getting back replies that you didn't expect.</p><p>Handling failures only at the client works when we have a set of clients talking to a single server. It can handle a server crash, but only if recovery means restarting that same server. If there's a permanent error, such as a dead power supply on the server hardware, this approach won't work. Because the application code in servers is usually the biggest source of failures in any architecture, depending on a single server is not a great idea.</p><p>So, pros and cons:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Pro: simple to understand and implement.</p></li><li class="listitem"><p>Pro: works easily with existing client and server application code.</p></li><li class="listitem"><p>Pro: ØMQ automatically retries the actual reconnection until it works.</p></li><li class="listitem"><p>Con: doesn't failover to backup or alternate servers.</p></li></ul></div></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch04s02.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch04.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch04s04.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Designing Reliability </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Basic Reliable Queuing (Simple Pirate Pattern)</td></tr></table></div></body></html>

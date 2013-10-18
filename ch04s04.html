@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Basic Reliable Queuing (Simple Pirate Pattern)</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch04.html" title="Chapter 4. Reliable Request-Reply Patterns" /><link rel="prev" href="ch04s03.html" title="Client-Side Reliability (Lazy Pirate Pattern)" /><link rel="next" href="ch04s05.html" title="Robust Reliable Queuing (Paranoid Pirate Pattern)" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Basic Reliable Queuing (Simple Pirate Pattern)</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch04s03.html">Prev</a> </td><th width="60%" align="center">Chapter 4. Reliable Request-Reply Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch04s05.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Basic Reliable Queuing (Simple Pirate Pattern)"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp19711936"></a>Basic Reliable Queuing (Simple Pirate Pattern)</h2></div></div></div><p>Our second approach extends the Lazy Pirate pattern with a queue proxy that lets us talk, transparently, to multiple servers, which we can more accurately call "workers". We'll develop this in stages, starting with a minimal working model, the Simple Pirate pattern.</p><p>In all these Pirate patterns, workers are stateless. If the application requires some shared state, such as a shared database, we don't know about it as we design our messaging framework. Having a queue proxy means workers can come and go without clients knowing anything about it. If one worker dies, another takes over. This is a nice, simple topology with only one real weakness, namely the central queue itself, which can become a problem to manage, and a single point of failure.</p><div class="figure"><a id="figure-48"></a><p class="title"><strong>Figure 4.2. The Simple Pirate Pattern</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig48.png" alt="The Simple Pirate Pattern" /></div></div></div><br class="figure-break" /><p>The basis for the queue proxy is the load balancing broker from Advanced Request-Reply Patterns<a class="xref" href="ch03.html" title="Chapter 3. Advanced Request-Reply Patterns">Chapter 3, <em>Advanced Request-Reply Patterns</em></a>. What is the very <span class="emphasis"><em>minimum</em></span> we need to do to handle dead or blocked workers? Turns out, it's surprisingly little. We already have a retry mechanism in the client. So using the load balancing pattern will work pretty well. This fits with ØMQ's philosophy that we can extend a peer-to-peer pattern like request-reply by plugging naive proxies in the middle<a class="xref" href="ch04s05.html#figure-49" title="Figure 4.3. The Paranoid Pirate Pattern">Figure 4.3, “The Paranoid Pirate Pattern”</a>.</p><p>We don't need a special client; we're still using the Lazy Pirate client. Here is the queue, which is identical to the main task of the load balancing broker:</p><div class="example"><a id="spqueue-c"></a><p class="title"><strong>Example 4.4. Simple Pirate queue (spqueue.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Simple Pirate broker
+//  This is identical to load-balancing pattern, with no reliability
+//  mechanisms. It depends on the client for recovery. Runs forever.
+
+#include "czmq.h"
+#define WORKER_READY   "\001"      //  Signals worker is ready
+
+int main (void)
+{
+    zctx_t *ctx = zctx_new ();
+    void *frontend = zsocket_new (ctx, ZMQ_ROUTER);
+    void *backend = zsocket_new (ctx, ZMQ_ROUTER);
+    zsocket_bind (frontend, "tcp://*:5555");    //  For clients
+    zsocket_bind (backend,  "tcp://*:5556");    //  For workers
+
+    //  Queue of available workers
+    zlist_t *workers = zlist_new ();
+    
+    //  The body of this example is exactly the same as lbbroker2.
+...
+}
+</pre></div></div><br class="example-break" /><p>Here is the worker, which takes the Lazy Pirate server and adapts it for the load balancing pattern (using the REQ "ready" signaling):</p><div class="example"><a id="spworker-c"></a><p class="title"><strong>Example 4.5. Simple Pirate worker (spworker.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Simple Pirate worker
+//  Connects REQ socket to tcp://*:5556
+//  Implements worker part of load-balancing
+
+#include "czmq.h"
+#define WORKER_READY   "\001"      //  Signals worker is ready
+
+int main (void)
+{
+    zctx_t *ctx = zctx_new ();
+    void *worker = zsocket_new (ctx, ZMQ_REQ);
+
+    //  Set random identity to make tracing easier
+    srandom ((unsigned) time (NULL));
+    char identity [10];
+    sprintf (identity, "%04X-%04X", randof (0x10000), randof (0x10000));
+    zmq_setsockopt (worker, ZMQ_IDENTITY, identity, strlen (identity));
+    zsocket_connect (worker, "tcp://localhost:5556");
+
+    //  Tell broker we're ready for work
+    printf ("I: (%s) worker ready\n", identity);
+    zframe_t *frame = zframe_new (WORKER_READY, 1);
+    zframe_send (&amp;frame, worker, 0);
+
+    int cycles = 0;
+    while (true) {
+        zmsg_t *msg = zmsg_recv (worker);
+        if (!msg)
+            break;              //  Interrupted
+
+        //  Simulate various problems, after a few cycles
+        cycles++;
+        if (cycles &gt; 3 &amp;&amp; randof (5) == 0) {
+            printf ("I: (%s) simulating a crash\n", identity);
+            zmsg_destroy (&amp;msg);
+            break;
+        }
+        else
+        if (cycles &gt; 3 &amp;&amp; randof (5) == 0) {
+            printf ("I: (%s) simulating CPU overload\n", identity);
+            sleep (3);
+            if (zctx_interrupted)
+                break;
+        }
+        printf ("I: (%s) normal reply\n", identity);
+        sleep (1);              //  Do some heavy work
+        zmsg_send (&amp;msg, worker);
+    }
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>To test this, start a handful of workers, a Lazy Pirate client, and the queue, in any order. You'll see that the workers eventually all crash and burn, and the client retries and then gives up. The queue never stops, and you can restart workers and clients ad nauseam. This model works with any number of clients and workers.</p></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch04s03.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch04.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch04s05.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Client-Side Reliability (Lazy Pirate Pattern) </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Robust Reliable Queuing (Paranoid Pirate Pattern)</td></tr></table></div></body></html>

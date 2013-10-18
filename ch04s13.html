@@ -1,0 +1,484 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>High-Availability Pair (Binary Star Pattern)</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch04.html" title="Chapter 4. Reliable Request-Reply Patterns" /><link rel="prev" href="ch04s12.html" title="Disconnected Reliability (Titanic Pattern)" /><link rel="next" href="ch04s14.html" title="Brokerless Reliability (Freelance Pattern)" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">High-Availability Pair (Binary Star Pattern)</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch04s12.html">Prev</a> </td><th width="60%" align="center">Chapter 4. Reliable Request-Reply Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch04s14.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="High-Availability Pair (Binary Star Pattern)"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp19984408"></a>High-Availability Pair (Binary Star Pattern)</h2></div></div></div><div class="figure"><a id="figure-52"></a><p class="title"><strong>Figure 4.6. High-Availability Pair, Normal Operation</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig52.png" alt="High-Availability Pair, Normal Operation" /></div></div></div><br class="figure-break" /><p>The Binary Star pattern puts two servers in a primary-backup high-availability pair<a class="xref" href="ch04s13.html#figure-53" title="Figure 4.7. High-availability Pair During Failover">Figure 4.7, “High-availability Pair During Failover”</a>. At any given time, one of these (the active) accepts connections from client applications. The other (the passive) does nothing, but the two servers monitor each other. If the active disappears from the network, after a certain time the passive takes over as active.</p><p>We developed the Binary Star pattern at iMatix for our <a class="ulink" href="http://www.openamq.org" target="_top">OpenAMQ server</a>. We designed it:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>To provide a straightforward high-availability solution.</p></li><li class="listitem"><p>To be simple enough to actually understand and use.</p></li><li class="listitem"><p>To fail over reliably when needed, and only when needed.</p></li></ul></div><p>Assuming we have a Binary Star pair running, here are the different scenarios that will result in a failover<a class="xref" href="ch04s13.html#figure-53" title="Figure 4.7. High-availability Pair During Failover">Figure 4.7, “High-availability Pair During Failover”</a>:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The hardware running the primary server has a fatal problem (power supply explodes, machine catches fire, or someone simply unplugs it by mistake), and disappears. Applications see this, and reconnect to the backup server.</p></li><li class="listitem"><p>The network segment on which the primary server sits crashes--perhaps a router gets hit by a power spike--and applications start to reconnect to the backup server.</p></li><li class="listitem"><p>The primary server crashes or is killed by the operator and does not restart automatically.</p></li></ul></div><div class="figure"><a id="figure-53"></a><p class="title"><strong>Figure 4.7. High-availability Pair During Failover</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig53.png" alt="High-availability Pair During Failover" /></div></div></div><br class="figure-break" /><p>Recovery from failover works as follows:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The operators restart the primary server and fix whatever problems were causing it to disappear from the network.</p></li><li class="listitem"><p>The operators stop the backup server at a moment when it will cause minimal disruption to applications.</p></li><li class="listitem"><p>When applications have reconnected to the primary server, the operators restart the backup server.</p></li></ul></div><p>Recovery (to using the primary server as active) is a manual operation. Painful experience teaches us that automatic recovery is undesirable. There are several reasons:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>Failover creates an interruption of service to applications, possibly lasting 10-30 seconds. If there is a real emergency, this is much better than total outage. But if recovery creates a further 10-30 second outage, it is better that this happens off-peak, when users have gone off the network.</p></li><li class="listitem"><p>When there is an emergency, the absolute first priority is certainty for those trying to fix things. Automatic recovery creates uncertainty for system administrators, who can no longer be sure which server is in charge without double-checking.</p></li><li class="listitem"><p>Automatic recovery can create situations where networks fail over and then recover, placing operators in the difficult position of analyzing what happened. There was an interruption of service, but the cause isn't clear.</p></li></ul></div><p>Having said this, the Binary Star pattern will fail back to the primary server if this is running (again) and the backup server fails. In fact, this is how we provoke recovery.</p><p>The shutdown process for a Binary Star pair is to either:</p><div class="orderedlist"><ol class="orderedlist" type="1"><li class="listitem"><p>Stop the passive server and then stop the active server at any later time, or</p></li><li class="listitem"><p>Stop both servers in any order but within a few seconds of each other.</p></li></ol></div><p>Stopping the active and then the passive server with any delay longer than the failover timeout will cause applications to disconnect, then reconnect, and then disconnect again, which may disturb users.</p><div class="sect2" title="Detailed Requirements"><div class="titlepage"><div><div><h3 class="title"><a id="idp19997720"></a>Detailed Requirements</h3></div></div></div><p>Binary Star is as simple as it can be, while still working accurately. In fact, the current design is the third complete redesign. Each of the previous designs we found to be too complex, trying to do too much, and we stripped out functionality until we came to a design that was understandable, easy to use, and reliable enough to be worth using.</p><p>These are our requirements for a high-availability architecture:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The failover is meant to provide insurance against catastrophic system failures, such as hardware breakdown, fire, accident, and so on. There are simpler ways to recover from ordinary server crashes and we already covered these.</p></li><li class="listitem"><p>Failover time should be under 60 seconds and preferably under 10 seconds.</p></li><li class="listitem"><p>Failover has to happen automatically, whereas recovery must happen manually. We want applications to switch over to the backup server automatically, but we do not want them to switch back to the primary server except when the operators have fixed whatever problem there was and decided that it is a good time to interrupt applications again.</p></li><li class="listitem"><p>The semantics for client applications should be simple and easy for developers to understand. Ideally, they should be hidden in the client API.</p></li><li class="listitem"><p>There should be clear instructions for network architects on how to avoid designs that could lead to <span class="emphasis"><em>split brain syndrome</em></span>, in which both servers in a Binary Star pair think they are the active server.</p></li><li class="listitem"><p>There should be no dependencies on the order in which the two servers are started.</p></li><li class="listitem"><p>It must be possible to make planned stops and restarts of either server without stopping client applications (though they may be forced to reconnect).</p></li><li class="listitem"><p>Operators must be able to monitor both servers at all times.</p></li><li class="listitem"><p>It must be possible to connect the two servers using a high-speed dedicated network connection. That is, failover synchronization must be able to use a specific IP route.</p></li></ul></div><p>We make the following assumptions:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>A single backup server provides enough insurance; we don't need multiple levels of backup.</p></li><li class="listitem"><p>The primary and backup servers are equally capable of carrying the application load. We do not attempt to balance load across the servers.</p></li><li class="listitem"><p>There is sufficient budget to cover a fully redundant backup server that does nothing almost all the time.</p></li></ul></div><p>We don't attempt to cover the following:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>The use of an active backup server or load balancing. In a Binary Star pair, the backup server is inactive and does no useful work until the primary server goes offline.</p></li><li class="listitem"><p>The handling of persistent messages or transactions in any way. We assume the existence of a network of unreliable (and probably untrusted) servers or Binary Star pairs.</p></li><li class="listitem"><p>Any automatic exploration of the network. The Binary Star pair is manually and explicitly defined in the network and is known to applications (at least in their configuration data).</p></li><li class="listitem"><p>Replication of state or messages between servers. All server-side state must be recreated by applications when they fail over.</p></li></ul></div><p>Here is the key terminology that we use in Binary Star:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p><span class="emphasis"><em>Primary</em></span>: the server that is normally or initially active.</p></li><li class="listitem"><p><span class="emphasis"><em>Backup</em></span>: the server that is normally passive. It will become active if and when the primary server disappears from the network, and when client applications ask the backup server to connect.</p></li><li class="listitem"><p><span class="emphasis"><em>Active</em></span>: the server that accepts client connections. There is at most one active server.</p></li><li class="listitem"><p><span class="emphasis"><em>Passive</em></span>: the server that takes over if the active disappears. Note that when a Binary Star pair is running normally, the primary server is active, and the backup is passive. When a failover has happened, the roles are switched.</p></li></ul></div><p>To configure a Binary Star pair, you need to:</p><div class="orderedlist"><ol class="orderedlist" type="1"><li class="listitem"><p>Tell the primary server where the backup server is located.</p></li><li class="listitem"><p>Tell the backup server where the primary server is located.</p></li><li class="listitem"><p>Optionally, tune the failover response times, which must be the same for both servers.</p></li></ol></div><p>The main tuning concern is how frequently you want the servers to check their peering status, and how quickly you want to activate failover. In our example, the failover timeout value defaults to 2,000 msec. If you reduce this, the backup server will take over as active more rapidly but may take over in cases where the primary server could recover. For example, you may have wrapped the primary server in a shell script that restarts it if it crashes. In that case, the timeout should be higher than the time needed to restart the primary server.</p><p>For client applications to work properly with a Binary Star pair, they must:</p><div class="orderedlist"><ol class="orderedlist" type="1"><li class="listitem"><p>Know both server addresses.</p></li><li class="listitem"><p>Try to connect to the primary server, and if that fails, to the backup server.</p></li><li class="listitem"><p>Detect a failed connection, typically using heartbeating.</p></li><li class="listitem"><p>Try to reconnect to the primary, and then backup (in that order), with a delay between retries that is at least as high as the server failover timeout.</p></li><li class="listitem"><p>Recreate all of the state they require on a server.</p></li><li class="listitem"><p>Retransmit messages lost during a failover, if messages need to be reliable.</p></li></ol></div><p>It's not trivial work, and we'd usually wrap this in an API that hides it from real end-user applications.</p><p>These are the main limitations of the Binary Star pattern:</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>A server process cannot be part of more than one Binary Star pair.</p></li><li class="listitem"><p>A primary server can have a single backup server, and no more.</p></li><li class="listitem"><p>The passive server does no useful work, and is thus wasted.</p></li><li class="listitem"><p>The backup server must be capable of handling full application loads.</p></li><li class="listitem"><p>Failover configuration cannot be modified at runtime.</p></li><li class="listitem"><p>Client applications must do some work to benefit from failover.</p></li></ul></div></div><div class="sect2" title="Preventing Split-Brain Syndrome"><div class="titlepage"><div><div><h3 class="title"><a id="idp20017544"></a>Preventing Split-Brain Syndrome</h3></div></div></div><p><span class="emphasis"><em>Split-brain syndrome</em></span> occurs when different parts of a cluster think they are active at the same time. It causes applications to stop seeing each other. Binary Star has an algorithm for detecting and eliminating split brain, which is based on a three-way decision mechanism (a server will not decide to become active until it gets application connection requests and it cannot see its peer server).</p><p>However, it is still possible to (mis)design a network to fool this algorithm. A typical scenario would be a Binary Star pair, that is distributed between two buildings, where each building also had a set of applications and where there was a single network link between both buildings. Breaking this link would create two sets of client applications, each with half of the Binary Star pair, and each failover server would become active.</p><p>To prevent split-brain situations, we must connect a Binary Star pair using a dedicated network link, which can be as simple as plugging them both into the same switch or, better, using a crossover cable directly between two machines.</p><p>We must not split a Binary Star architecture into two islands, each with a set of applications. While this may be a common type of network architecture, you should use federation, not high-availability failover, in such cases.</p><p>A suitably paranoid network configuration would use two private cluster interconnects, rather than a single one. Further, the network cards used for the cluster would be different from those used for message traffic, and possibly even on different paths on the server hardware. The goal is to separate possible failures in the network from possible failures in the cluster. Network ports can have a relatively high failure rate.</p></div><div class="sect2" title="Binary Star Implementation"><div class="titlepage"><div><div><h3 class="title"><a id="idp20020800"></a>Binary Star Implementation</h3></div></div></div><p>Without further ado, here is a proof-of-concept implementation of the Binary Star server. The primary and backup servers run the same code, you choose their roles when you run the code:</p><div class="example"><a id="bstarsrv-c"></a><p class="title"><strong>Example 4.61. Binary Star server (bstarsrv.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Binary Star server proof-of-concept implementation. This server does no
+//  real work; it just demonstrates the Binary Star failover model.
+
+#include "czmq.h"
+
+//  States we can be in at any point in time
+typedef enum {
+    STATE_PRIMARY = 1,          //  Primary, waiting for peer to connect
+    STATE_BACKUP = 2,           //  Backup, waiting for peer to connect
+    STATE_ACTIVE = 3,           //  Active - accepting connections
+    STATE_PASSIVE = 4           //  Passive - not accepting connections
+} state_t;
+
+//  Events, which start with the states our peer can be in
+typedef enum {
+    PEER_PRIMARY = 1,           //  HA peer is pending primary
+    PEER_BACKUP = 2,            //  HA peer is pending backup
+    PEER_ACTIVE = 3,            //  HA peer is active
+    PEER_PASSIVE = 4,           //  HA peer is passive
+    CLIENT_REQUEST = 5          //  Client makes request
+} event_t;
+
+//  Our finite state machine
+typedef struct {
+    state_t state;              //  Current state
+    event_t event;              //  Current event
+    int64_t peer_expiry;        //  When peer is considered 'dead'
+} bstar_t;
+
+//  We send state information this often
+//  If peer doesn't respond in two heartbeats, it is 'dead'
+#define HEARTBEAT 1000          //  In msecs
+</pre></div></div><br class="example-break" /><p>The heart of the Binary Star design is its finite-state machine (FSM). The FSM runs one event at a time. We apply an event to the current state, which checks if the event is accepted, and if so, sets a new state: 
+</p><div class="example"><a id="bstarsrv-c-1"></a><p class="title"><strong>Example 4.62. Binary Star server (bstarsrv.c) - Binary Star state machine</strong></p><div class="example-contents"><pre class="programlisting">
+
+static bool
+s_state_machine (bstar_t *fsm)
+{
+    bool exception = false;
+    
+    //  These are the PRIMARY and BACKUP states; we're waiting to become
+    //  ACTIVE or PASSIVE depending on events we get from our peer:
+    if (fsm-&gt;state == STATE_PRIMARY) {
+        if (fsm-&gt;event == PEER_BACKUP) {
+            printf ("I: connected to backup (passive), ready active\n");
+            fsm-&gt;state = STATE_ACTIVE;
+        }
+        else
+        if (fsm-&gt;event == PEER_ACTIVE) {
+            printf ("I: connected to backup (active), ready passive\n");
+            fsm-&gt;state = STATE_PASSIVE;
+        }
+        //  Accept client connections
+    }
+    else
+    if (fsm-&gt;state == STATE_BACKUP) {
+        if (fsm-&gt;event == PEER_ACTIVE) {
+            printf ("I: connected to primary (active), ready passive\n");
+            fsm-&gt;state = STATE_PASSIVE;
+        }
+        else
+        //  Reject client connections when acting as backup
+        if (fsm-&gt;event == CLIENT_REQUEST)
+            exception = true;
+    }
+    else
+</pre></div></div><br class="example-break" /><p>These are the ACTIVE and PASSIVE states: 
+</p><div class="example"><a id="bstarsrv-c-2"></a><p class="title"><strong>Example 4.63. Binary Star server (bstarsrv.c) - active and passive states</strong></p><div class="example-contents"><pre class="programlisting">
+    if (fsm-&gt;state == STATE_ACTIVE) {
+        if (fsm-&gt;event == PEER_ACTIVE) {
+            //  Two actives would mean split-brain
+            printf ("E: fatal error - dual actives, aborting\n");
+            exception = true;
+        }
+    }
+    else
+    //  Server is passive
+    //  CLIENT_REQUEST events can trigger failover if peer looks dead
+    if (fsm-&gt;state == STATE_PASSIVE) {
+        if (fsm-&gt;event == PEER_PRIMARY) {
+            //  Peer is restarting - become active, peer will go passive
+            printf ("I: primary (passive) is restarting, ready active\n");
+            fsm-&gt;state = STATE_ACTIVE;
+        }
+        else
+        if (fsm-&gt;event == PEER_BACKUP) {
+            //  Peer is restarting - become active, peer will go passive
+            printf ("I: backup (passive) is restarting, ready active\n");
+            fsm-&gt;state = STATE_ACTIVE;
+        }
+        else
+        if (fsm-&gt;event == PEER_PASSIVE) {
+            //  Two passives would mean cluster would be non-responsive
+            printf ("E: fatal error - dual passives, aborting\n");
+            exception = true;
+        }
+        else
+        if (fsm-&gt;event == CLIENT_REQUEST) {
+            //  Peer becomes active if timeout has passed
+            //  It's the client request that triggers the failover
+            assert (fsm-&gt;peer_expiry &gt; 0);
+            if (zclock_time () &gt;= fsm-&gt;peer_expiry) {
+                //  If peer is dead, switch to the active state
+                printf ("I: failover successful, ready active\n");
+                fsm-&gt;state = STATE_ACTIVE;
+            }
+            else
+                //  If peer is alive, reject connections
+                exception = true;
+        }
+    }
+    return exception;
+}
+</pre></div></div><br class="example-break" /><p>This is our main task. First we bind/connect our sockets with our peer and make sure we will get state messages correctly. We use three sockets; one to publish state, one to subscribe to state, and one for client requests/replies: 
+</p><div class="example"><a id="bstarsrv-c-3"></a><p class="title"><strong>Example 4.64. Binary Star server (bstarsrv.c) - main task</strong></p><div class="example-contents"><pre class="programlisting">
+
+int main (int argc, char *argv [])
+{
+    //  Arguments can be either of:
+    //      -p  primary server, at tcp://localhost:5001
+    //      -b  backup server, at tcp://localhost:5002
+    zctx_t *ctx = zctx_new ();
+    void *statepub = zsocket_new (ctx, ZMQ_PUB);
+    void *statesub = zsocket_new (ctx, ZMQ_SUB);
+    zsocket_set_subscribe (statesub, "");
+    void *frontend = zsocket_new (ctx, ZMQ_ROUTER);
+    bstar_t fsm = { 0 };
+
+    if (argc == 2 &amp;&amp; streq (argv [1], "-p")) {
+        printf ("I: Primary active, waiting for backup (passive)\n");
+        zsocket_bind (frontend, "tcp://*:5001");
+        zsocket_bind (statepub, "tcp://*:5003");
+        zsocket_connect (statesub, "tcp://localhost:5004");
+        fsm.state = STATE_PRIMARY;
+    }
+    else
+    if (argc == 2 &amp;&amp; streq (argv [1], "-b")) {
+        printf ("I: Backup passive, waiting for primary (active)\n");
+        zsocket_bind (frontend, "tcp://*:5002");
+        zsocket_bind (statepub, "tcp://*:5004");
+        zsocket_connect (statesub, "tcp://localhost:5003");
+        fsm.state = STATE_BACKUP;
+    }
+    else {
+        printf ("Usage: bstarsrv { -p | -b }\n");
+        zctx_destroy (&amp;ctx);
+        exit (0);
+    }
+</pre></div></div><br class="example-break" /><p>We now process events on our two input sockets, and process these events one at a time via our finite-state machine. Our "work" for a client request is simply to echo it back: 
+</p><div class="example"><a id="bstarsrv-c-4"></a><p class="title"><strong>Example 4.65. Binary Star server (bstarsrv.c) - handling socket input</strong></p><div class="example-contents"><pre class="programlisting">
+    //  Set timer for next outgoing state message
+    int64_t send_state_at = zclock_time () + HEARTBEAT;
+    while (!zctx_interrupted) {
+        zmq_pollitem_t items [] = {
+            { frontend, 0, ZMQ_POLLIN, 0 },
+            { statesub, 0, ZMQ_POLLIN, 0 }
+        };
+        int time_left = (int) ((send_state_at - zclock_time ()));
+        if (time_left &lt; 0)
+            time_left = 0;
+        int rc = zmq_poll (items, 2, time_left * ZMQ_POLL_MSEC);
+        if (rc == -1)
+            break;              //  Context has been shut down
+
+        if (items [0].revents &amp; ZMQ_POLLIN) {
+            //  Have a client request
+            zmsg_t *msg = zmsg_recv (frontend);
+            fsm.event = CLIENT_REQUEST;
+            if (s_state_machine (&amp;fsm) == false)
+                //  Answer client by echoing request back
+                zmsg_send (&amp;msg, frontend);
+            else
+                zmsg_destroy (&amp;msg);
+        }
+        if (items [1].revents &amp; ZMQ_POLLIN) {
+            //  Have state from our peer, execute as event
+            char *message = zstr_recv (statesub);
+            fsm.event = atoi (message);
+            free (message);
+            if (s_state_machine (&amp;fsm))
+                break;          //  Error, so exit
+            fsm.peer_expiry = zclock_time () + 2 * HEARTBEAT;
+        }
+        //  If we timed out, send state to peer
+        if (zclock_time () &gt;= send_state_at) {
+            char message [2];
+            sprintf (message, "%d", fsm.state);
+            zstr_send (statepub, message);
+            send_state_at = zclock_time () + HEARTBEAT;
+        }
+    }
+    if (zctx_interrupted)
+        printf ("W: interrupted\n");
+
+    //  Shutdown sockets and context
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>And here is the client:</p><div class="example"><a id="bstarcli-c"></a><p class="title"><strong>Example 4.66. Binary Star client (bstarcli.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Binary Star client proof-of-concept implementation. This client does no
+//  real work; it just demonstrates the Binary Star failover model.
+
+#include "czmq.h"
+#define REQUEST_TIMEOUT     1000    //  msecs
+#define SETTLE_DELAY        2000    //  Before failing over
+
+int main (void)
+{
+    zctx_t *ctx = zctx_new ();
+
+    char *server [] = { "tcp://localhost:5001", "tcp://localhost:5002" };
+    uint server_nbr = 0;
+
+    printf ("I: connecting to server at %s...\n", server [server_nbr]);
+    void *client = zsocket_new (ctx, ZMQ_REQ);
+    zsocket_connect (client, server [server_nbr]);
+
+    int sequence = 0;
+    while (!zctx_interrupted) {
+        //  We send a request, then we work to get a reply
+        char request [10];
+        sprintf (request, "%d", ++sequence);
+        zstr_send (client, request);
+
+        int expect_reply = 1;
+        while (expect_reply) {
+            //  Poll socket for a reply, with timeout
+            zmq_pollitem_t items [] = { { client, 0, ZMQ_POLLIN, 0 } };
+            int rc = zmq_poll (items, 1, REQUEST_TIMEOUT * ZMQ_POLL_MSEC);
+            if (rc == -1)
+                break;          //  Interrupted
+</pre></div></div><br class="example-break" /><p>We use a Lazy Pirate strategy in the client. If there's no reply within our timeout, we close the socket and try again. In Binary Star, it's the client vote that decides which server is primary; the client must therefore try to connect to each server in turn: 
+</p><div class="example"><a id="bstarcli-c-1"></a><p class="title"><strong>Example 4.67. Binary Star client (bstarcli.c) - main body of client</strong></p><div class="example-contents"><pre class="programlisting">
+
+            if (items [0].revents &amp; ZMQ_POLLIN) {
+                //  We got a reply from the server, must match sequence
+                char *reply = zstr_recv (client);
+                if (atoi (reply) == sequence) {
+                    printf ("I: server replied OK (%s)\n", reply);
+                    expect_reply = 0;
+                    sleep (1);  //  One request per second
+                }
+                else
+                    printf ("E: bad reply from server: %s\n", reply);
+                free (reply);
+            }
+            else {
+                printf ("W: no response from server, failing over\n");
+                
+                //  Old socket is confused; close it and open a new one
+                zsocket_destroy (ctx, client);
+                server_nbr = (server_nbr + 1) % 2;
+                zclock_sleep (SETTLE_DELAY);
+                printf ("I: connecting to server at %s...\n",
+                        server [server_nbr]);
+                client = zsocket_new (ctx, ZMQ_REQ);
+                zsocket_connect (client, server [server_nbr]);
+
+                //  Send request again, on new socket
+                zstr_send (client, request);
+            }
+        }
+    }
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>To test Binary Star, start the servers and client in any order:</p><pre class="screen">bstarsrv -p     # Start primary
+bstarsrv -b     # Start backup
+bstarcli
+</pre><p>You can then provoke failover by killing the primary server, and recovery by restarting the primary and killing the backup. Note how it's the client vote that triggers failover, and recovery.</p><p>Binary star is driven by a finite state machine<a class="xref" href="ch04s13.html#figure-54" title="Figure 4.8. Binary Star Finite State Machine">Figure 4.8, “Binary Star Finite State Machine”</a>. Events are the peer state, so "Peer Active" means the other server has told us it's active. "Client Request" means we've received a client request. "Client Vote" means we've received a client request AND our peer is inactive for two heartbeats.</p><p>Note that the servers use PUB-SUB sockets for state exchange. No other socket combination will work here. PUSH and DEALER block if there is no peer ready to receive a message. PAIR does not reconnect if the peer disappears and comes back. ROUTER needs the address of the peer before it can send it a message.</p><div class="figure"><a id="figure-54"></a><p class="title"><strong>Figure 4.8. Binary Star Finite State Machine</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig54.png" alt="Binary Star Finite State Machine" /></div></div></div><br class="figure-break" /></div><div class="sect2" title="Binary Star Reactor"><div class="titlepage"><div><div><h3 class="title"><a id="idp20045712"></a>Binary Star Reactor</h3></div></div></div><p>Binary Star is useful and generic enough to package up as a reusable reactor class. The reactor then runs and calls our code whenever it has a message to process. This is much nicer than copying/pasting the Binary Star code into each server where we want that capability.</p><p>In C, we wrap the CZMQ <code class="literal">zloop</code> class that we saw before. <code class="literal">zloop</code> lets you register handlers to react on socket and timer events. In the Binary Star reactor, we provide handlers for voters and for state changes (active to passive, and vice versa). Here is the <code class="literal">bstar</code> API:</p><pre class="programlisting">
+//  Create a new Binary Star instance, using local (bind) and
+//  remote (connect) endpoints to set up the server peering.
+bstar_t *bstar_new (int primary, char *local, char *remote);
+
+//  Destroy a Binary Star instance
+void bstar_destroy (bstar_t **self_p);
+
+//  Return underlying zloop reactor, for timer and reader
+//  registration and cancelation.
+zloop_t *bstar_zloop (bstar_t *self);
+
+//  Register voting reader
+int bstar_voter (bstar_t *self, char *endpoint, int type,
+                 zloop_fn handler, void *arg);
+
+//  Register main state change handlers
+void bstar_new_active (bstar_t *self, zloop_fn handler, void *arg);
+void bstar_new_passive (bstar_t *self, zloop_fn handler, void *arg);
+
+//  Start the reactor, which ends if a callback function returns -1, 
+//  or the process received SIGINT or SIGTERM.
+int bstar_start (bstar_t *self);
+</pre><p>And here is the class implementation:</p><div class="example"><a id="bstar-c"></a><p class="title"><strong>Example 4.68. Binary Star core class (bstar.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  bstar class - Binary Star reactor
+
+#include "bstar.h"
+
+//  States we can be in at any point in time
+typedef enum {
+    STATE_PRIMARY = 1,          //  Primary, waiting for peer to connect
+    STATE_BACKUP = 2,           //  Backup, waiting for peer to connect
+    STATE_ACTIVE = 3,           //  Active - accepting connections
+    STATE_PASSIVE = 4           //  Passive - not accepting connections
+} state_t;
+
+//  Events, which start with the states our peer can be in
+typedef enum {
+    PEER_PRIMARY = 1,           //  HA peer is pending primary
+    PEER_BACKUP = 2,            //  HA peer is pending backup
+    PEER_ACTIVE = 3,            //  HA peer is active
+    PEER_PASSIVE = 4,           //  HA peer is passive
+    CLIENT_REQUEST = 5          //  Client makes request
+} event_t;
+
+//  Structure of our class
+
+struct _bstar_t {
+    zctx_t *ctx;                //  Our private context
+    zloop_t *loop;              //  Reactor loop
+    void *statepub;             //  State publisher
+    void *statesub;             //  State subscriber
+    state_t state;              //  Current state
+    event_t event;              //  Current event
+    int64_t peer_expiry;        //  When peer is considered 'dead'
+    zloop_fn *voter_fn;         //  Voting socket handler
+    void *voter_arg;            //  Arguments for voting handler
+    zloop_fn *active_fn;        //  Call when become active
+    void *active_arg;           //  Arguments for handler
+    zloop_fn *passive_fn;         //  Call when become passive
+    void *passive_arg;            //  Arguments for handler
+};
+
+//  The finite-state machine is the same as in the proof-of-concept server.
+//  To understand this reactor in detail, first read the CZMQ zloop class.
+...
+</pre></div></div><br class="example-break" /><p>This is the constructor for our <code class="literal">bstar</code> class. We have to tell it whether we're primary or backup server, as well as our local and remote endpoints to bind and connect to: 
+</p><div class="example"><a id="bstar-c-1"></a><p class="title"><strong>Example 4.69. Binary Star core class (bstar.c) - constructor</strong></p><div class="example-contents"><pre class="programlisting">
+bstar_t *
+bstar_new (int primary, char *local, char *remote)
+{
+    bstar_t
+        *self;
+
+    self = (bstar_t *) zmalloc (sizeof (bstar_t));
+
+    //  Initialize the Binary Star
+    self-&gt;ctx = zctx_new ();
+    self-&gt;loop = zloop_new ();
+    self-&gt;state = primary? STATE_PRIMARY: STATE_BACKUP;
+
+    //  Create publisher for state going to peer
+    self-&gt;statepub = zsocket_new (self-&gt;ctx, ZMQ_PUB);
+    zsocket_bind (self-&gt;statepub, local);
+
+    //  Create subscriber for state coming from peer
+    self-&gt;statesub = zsocket_new (self-&gt;ctx, ZMQ_SUB);
+    zsocket_set_subscribe (self-&gt;statesub, "");
+    zsocket_connect (self-&gt;statesub, remote);
+
+    //  Set-up basic reactor events
+    zloop_timer (self-&gt;loop, BSTAR_HEARTBEAT, 0, s_send_state, self);
+    zmq_pollitem_t poller = { self-&gt;statesub, 0, ZMQ_POLLIN };
+    zloop_poller (self-&gt;loop, &amp;poller, s_recv_state, self);
+    return self;
+}
+</pre></div></div><br class="example-break" /><p>The destructor shuts down the bstar reactor: 
+</p><div class="example"><a id="bstar-c-2"></a><p class="title"><strong>Example 4.70. Binary Star core class (bstar.c) - destructor</strong></p><div class="example-contents"><pre class="programlisting">
+
+void
+bstar_destroy (bstar_t **self_p)
+{
+    assert (self_p);
+    if (*self_p) {
+        bstar_t *self = *self_p;
+        zloop_destroy (&amp;self-&gt;loop);
+        zctx_destroy (&amp;self-&gt;ctx);
+        free (self);
+        *self_p = NULL;
+    }
+}
+</pre></div></div><br class="example-break" /><p>This method returns the underlying zloop reactor, so we can add additional timers and readers: 
+</p><div class="example"><a id="bstar-c-3"></a><p class="title"><strong>Example 4.71. Binary Star core class (bstar.c) - zloop method</strong></p><div class="example-contents"><pre class="programlisting">
+
+zloop_t *
+bstar_zloop (bstar_t *self)
+{
+    return self-&gt;loop;
+}
+</pre></div></div><br class="example-break" /><p>This method registers a client voter socket. Messages received on this socket provide the CLIENT_REQUEST events for the Binary Star FSM and are passed to the provided application handler. We require exactly one voter per <code class="literal">bstar</code> instance: 
+</p><div class="example"><a id="bstar-c-4"></a><p class="title"><strong>Example 4.72. Binary Star core class (bstar.c) - voter method</strong></p><div class="example-contents"><pre class="programlisting">
+
+int
+bstar_voter (bstar_t *self, char *endpoint, int type, zloop_fn handler,
+             void *arg)
+{
+    //  Hold actual handler+arg so we can call this later
+    void *socket = zsocket_new (self-&gt;ctx, type);
+    zsocket_bind (socket, endpoint);
+    assert (!self-&gt;voter_fn);
+    self-&gt;voter_fn = handler;
+    self-&gt;voter_arg = arg;
+    zmq_pollitem_t poller = { socket, 0, ZMQ_POLLIN };
+    return zloop_poller (self-&gt;loop, &amp;poller, s_voter_ready, self);
+}
+</pre></div></div><br class="example-break" /><p>Register handlers to be called each time there's a state change: 
+</p><div class="example"><a id="bstar-c-5"></a><p class="title"><strong>Example 4.73. Binary Star core class (bstar.c) - register state-change handlers</strong></p><div class="example-contents"><pre class="programlisting">
+
+void
+bstar_new_active (bstar_t *self, zloop_fn handler, void *arg)
+{
+    assert (!self-&gt;active_fn);
+    self-&gt;active_fn = handler;
+    self-&gt;active_arg = arg;
+}
+
+void
+bstar_new_passive (bstar_t *self, zloop_fn handler, void *arg)
+{
+    assert (!self-&gt;passive_fn);
+    self-&gt;passive_fn = handler;
+    self-&gt;passive_arg = arg;
+}
+</pre></div></div><br class="example-break" /><p>Enable/disable verbose tracing, for debugging: 
+</p><div class="example"><a id="bstar-c-6"></a><p class="title"><strong>Example 4.74. Binary Star core class (bstar.c) - enable/disable tracing</strong></p><div class="example-contents"><pre class="programlisting">
+
+void bstar_set_verbose (bstar_t *self, bool verbose)
+{
+    zloop_set_verbose (self-&gt;loop, verbose);
+}
+</pre></div></div><br class="example-break" /><p>Finally, start the configured reactor. It will end if any handler returns -1 to the reactor, or if the process receives SIGINT or SIGTERM: 
+</p><div class="example"><a id="bstar-c-7"></a><p class="title"><strong>Example 4.75. Binary Star core class (bstar.c) - start the reactor</strong></p><div class="example-contents"><pre class="programlisting">
+
+int
+bstar_start (bstar_t *self)
+{
+    assert (self-&gt;voter_fn);
+    s_update_peer_expiry (self);
+    return zloop_start (self-&gt;loop);
+}
+</pre></div></div><br class="example-break" /><p>This gives us the following short main program for the server:</p><div class="example"><a id="bstarsrv2-c"></a><p class="title"><strong>Example 4.76. Binary Star server, using core class (bstarsrv2.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Binary Star server, using bstar reactor
+
+//  Lets us build this source without creating a library
+#include "bstar.c"
+
+//  Echo service
+int s_echo (zloop_t *loop, zmq_pollitem_t *poller, void *arg)
+{
+    zmsg_t *msg = zmsg_recv (poller-&gt;socket);
+    zmsg_send (&amp;msg, poller-&gt;socket);
+    return 0;
+}
+
+int main (int argc, char *argv [])
+{
+    //  Arguments can be either of:
+    //      -p  primary server, at tcp://localhost:5001
+    //      -b  backup server, at tcp://localhost:5002
+    bstar_t *bstar;
+    if (argc == 2 &amp;&amp; streq (argv [1], "-p")) {
+        printf ("I: Primary active, waiting for backup (passive)\n");
+        bstar = bstar_new (BSTAR_PRIMARY,
+            "tcp://*:5003", "tcp://localhost:5004");
+        bstar_voter (bstar, "tcp://*:5001", ZMQ_ROUTER, s_echo, NULL);
+    }
+    else
+    if (argc == 2 &amp;&amp; streq (argv [1], "-b")) {
+        printf ("I: Backup passive, waiting for primary (active)\n");
+        bstar = bstar_new (BSTAR_BACKUP,
+            "tcp://*:5004", "tcp://localhost:5003");
+        bstar_voter (bstar, "tcp://*:5002", ZMQ_ROUTER, s_echo, NULL);
+    }
+    else {
+        printf ("Usage: bstarsrvs { -p | -b }\n");
+        exit (0);
+    }
+    bstar_start (bstar);
+    bstar_destroy (&amp;bstar);
+    return 0;
+}
+</pre></div></div><br class="example-break" /></div></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch04s12.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch04.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch04s14.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Disconnected Reliability (Titanic Pattern) </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Brokerless Reliability (Freelance Pattern)</td></tr></table></div></body></html>

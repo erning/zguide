@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>让消息流动起来</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch01.html" title="Chapter 1. ØMQ基础" /><link rel="prev" href="ch01s06.html" title="获取版本号" /><link rel="next" href="ch01s08.html" title="分布式处理" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">让消息流动起来</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch01s06.html">Prev</a> </td><th width="60%" align="center">Chapter 1. ØMQ基础</th><td width="20%" align="right"> <a accesskey="n" href="ch01s08.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="让消息流动起来"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp18974000"></a>让消息流动起来</h2></div></div></div><p>第二种经典的消息模式是单向数据分发：服务端将更新事件发送给一组客户端。让我们看一个天气信息发布的例子，包括邮编、温度、相对湿度。我们随机生成这些信息，气象站好像也是这么干的。</p><p>下面是服务端的代码，使用5556端口：</p><div class="example"><a id="wuserver-c"></a><p class="title"><strong>Example 1.7. Weather update server (wuserver.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Weather update server
+//  Binds PUB socket to tcp://*:5556
+//  Publishes random weather updates
+
+#include "zhelpers.h"
+
+int main (void)
+{
+    //  Prepare our context and publisher
+    void *context = zmq_ctx_new ();
+    void *publisher = zmq_socket (context, ZMQ_PUB);
+    int rc = zmq_bind (publisher, "tcp://*:5556");
+    assert (rc == 0);
+    rc = zmq_bind (publisher, "ipc://weather.ipc");
+    assert (rc == 0);
+
+    //  Initialize random number generator
+    srandom ((unsigned) time (NULL));
+    while (1) {
+        //  Get values that will fool the boss
+        int zipcode, temperature, relhumidity;
+        zipcode     = randof (100000);
+        temperature = randof (215) - 80;
+        relhumidity = randof (50) + 10;
+
+        //  Send message to all subscribers
+        char update [20];
+        sprintf (update, "%05d %d %d", zipcode, temperature, relhumidity);
+        s_send (publisher, update);
+    }
+    zmq_close (publisher);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>这项更新服务没有开始、没有结束，就像永不消失的电波一样<a class="xref" href="ch01s07.html#figure-4" title="Figure 1.3. Publish-Subscribe">Figure 1.3, “Publish-Subscribe”</a>。</p><p>下面是客户端程序，它会接受发布者的消息，只处理特定邮编标注的信息，如纽约的邮编是10001:</p><div class="example"><a id="wuclient-c"></a><p class="title"><strong>Example 1.8. Weather update client (wuclient.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Weather update client
+//  Connects SUB socket to tcp://localhost:5556
+//  Collects weather updates and finds avg temp in zipcode
+
+#include "zhelpers.h"
+
+int main (int argc, char *argv [])
+{
+    //  Socket to talk to server
+    printf ("Collecting updates from weather server...\n");
+    void *context = zmq_ctx_new ();
+    void *subscriber = zmq_socket (context, ZMQ_SUB);
+    int rc = zmq_connect (subscriber, "tcp://localhost:5556");
+    assert (rc == 0);
+
+    //  Subscribe to zipcode, default is NYC, 10001
+    char *filter = (argc &gt; 1)? argv [1]: "10001 ";
+    rc = zmq_setsockopt (subscriber, ZMQ_SUBSCRIBE,
+                         filter, strlen (filter));
+    assert (rc == 0);
+
+    //  Process 100 updates
+    int update_nbr;
+    long total_temp = 0;
+    for (update_nbr = 0; update_nbr &lt; 100; update_nbr++) {
+        char *string = s_recv (subscriber);
+
+        int zipcode, temperature, relhumidity;
+        sscanf (string, "%d %d %d",
+            &amp;zipcode, &amp;temperature, &amp;relhumidity);
+        total_temp += temperature;
+        free (string);
+    }
+    printf ("Average temperature for zipcode '%s' was %dF\n",
+        filter, (int) (total_temp / update_nbr));
+
+    zmq_close (subscriber);
+    zmq_ctx_destroy (context);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><div class="figure"><a id="figure-4"></a><p class="title"><strong>Figure 1.3. Publish-Subscribe</strong></p><div class="figure-contents"><div class="mediaobject"><img src="images/fig4.png" alt="Publish-Subscribe" /></div></div></div><br class="figure-break" /><p>需要注意的是，在使用SUB套接字时，必须使用<code class="literal">zmq_setsockopt()</code>方法来设置订阅的内容。如果你不设置订阅内容，那将什么消息都收不到，新手很容易犯这个错误。订阅信息可以是任何字符串，可以设置多次。只要消息满足其中一条订阅信息，SUB套接字就会收到。订阅者可以选择不接收某类消息，也是通过<code class="literal">zmq_setsockopt()</code>方法实现的。</p><p>PUB-SUB套接字组合是异步的。客户端在一个循环体中使用<code class="literal">zmq_recv()</code>接收消息，如果向SUB套接字发送消息则会报错；类似地，服务端可以不断地使用<code class="literal">zmq_send()</code>发送消息，但不能再PUB套接字上使用<code class="literal">zme_recv()</code>。</p><p>In theory with ØMQ sockets, it does not matter which end connects and which end binds. However, in practice there are undocumented differences that I'll come to later. For now, bind the PUB and connect the SUB, unless your network design makes that impossible.</p><p>关于PUB-SUB套接字，还有一点需要注意：你无法得知SUB是何时开始接收消息的。就算你先打开了SUB套接字，后打开PUB发送消息，这时<span class="bold"><strong>SUB还是会丢失一些消息</strong></span>的，因为建立连接是需要一些时间的。很少，但并不是零。</p><p>这种“慢连接”的症状一开始会让很多人困惑，所以这里我要详细解释一下。还记得ZMQ是在后台进行异步的I/O传输的，如果你有两个节点用以下顺序相连：</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>订阅者连接至端点接收消息并计数；</p></li><li class="listitem"><p>发布者绑定至端点并立刻发送1000条消息。</p></li></ul></div><p>运行的结果很可能是订阅者一条消息都收不到。这时你可能会傻眼，忙于检查有没有设置订阅信息，并重新尝试，但结果还是一样。</p><p>我们知道在建立TCP连接时需要进行三次握手，会耗费几毫秒的时间，而当节点数增加时这个数字也会上升。在这么短的时间里，ØMQ就可以发送很多很多消息了。举例来说，如果建立连接需要耗时5毫秒，而ØMQ只需要1毫秒就可以发送完这1000条消息。</p><p>Sockets and Patterns<a class="xref" href="ch02.html" title="Chapter 2. Sockets and Patterns">Chapter 2, <em>Sockets and Patterns</em></a> 中我会解释如何使发布者和订阅者同步，只有当订阅者准备好时发布者才会开始发送消息。有一种简单的方法来同步PUB和SUB，就是让PUB延迟一段时间再发送消息。现实编程中我不建议使用这种方式，因为它太脆弱了，而且不好控制。不过这里我们先暂且使用sleep的方式来解决，等到 Sockets and Patterns<a class="xref" href="ch02.html" title="Chapter 2. Sockets and Patterns">Chapter 2, <em>Sockets and Patterns</em></a> 的时候再讲述正确的处理方式。</p><p>另一种同步的方式则是认为发布者的消息流是无穷无尽的，因此丢失了前面一部分信息也没有关系。我们的气象信息客户端就是这么做的。</p><p>示例中的气象信息客户端会收集指定邮编的一百条信息，其间大约有1000万条信息被发布。你可以先打开客户端，再打开服务端，工作一段时间后重启服务端，这时客户端仍会正常工作。当客户端收集完所需信息后，会计算并输出平均温度。</p><p>关于发布-订阅模式的几点说明：</p><div class="itemizedlist"><ul class="itemizedlist" type="disc"><li class="listitem"><p>订阅者可以连接多个发布者，轮流接收消息；</p></li><li class="listitem"><p>如果发布者没有订阅者与之相连，那它发送的消息将直接被丢弃；</p></li><li class="listitem"><p>如果你使用TCP协议，那当订阅者处理速度过慢时，消息会在发布者处堆积。以后我们会讨论如何使用阈值（HWM）来保护发布者。</p></li><li class="listitem"><p>从ØMQ v3.x开始，当使用<code class="literal">tcp://</code>或<code class="literal">ipc://</code>协议时，消息的过滤是在发布者处进行的当使用<code class="literal">epgm://}</code>协议时，消息的过滤是在订阅者处进行的；在ØMQ v2.x中，消息的过滤总是在订阅者处进行的。</p></li></ul></div><p>我在自己的计算机（2011-era Intel i5）上尝试发布1000万条消息，速度很快，但没什么特别的：</p><pre class="screen">$ time wuclient
+Collecting updates from weather server...
+Average temperature for zipcode '10001 ' was 28F
+
+real    0m4.470s
+user    0m0.000s
+sys     0m0.008s
+</pre></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch01s06.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch01.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch01s08.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">获取版本号 </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> 分布式处理</td></tr></table></div></body></html>

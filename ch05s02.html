@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /><title>Pub-Sub Tracing (Espresso Pattern)</title><meta name="generator" content="DocBook XSL Stylesheets V1.76.1" /><link rel="home" href="index.html" title="The ZeroMQ Guide - for C Developers" /><link rel="up" href="ch05.html" title="Chapter 5. Advanced Pub-Sub Patterns" /><link rel="prev" href="ch05.html" title="Chapter 5. Advanced Pub-Sub Patterns" /><link rel="next" href="ch05s03.html" title="Last Value Caching" /></head><body><div class="navheader"><table width="100%" summary="Navigation header"><tr><th colspan="3" align="center">Pub-Sub Tracing (Espresso Pattern)</th></tr><tr><td width="20%" align="left"><a accesskey="p" href="ch05.html">Prev</a> </td><th width="60%" align="center">Chapter 5. Advanced Pub-Sub Patterns</th><td width="20%" align="right"> <a accesskey="n" href="ch05s03.html">Next</a></td></tr></table><hr /></div><div class="sect1" title="Pub-Sub Tracing (Espresso Pattern)"><div class="titlepage"><div><div><h2 class="title" style="clear: both"><a id="idp20175664"></a>Pub-Sub Tracing (Espresso Pattern)</h2></div></div></div><p>Let's start this chapter by looking at a way to trace pub-sub networks. In Sockets and Patterns<a class="xref" href="ch02.html" title="Chapter 2. Sockets and Patterns">Chapter 2, <em>Sockets and Patterns</em></a> we saw a simple proxy that used these to do transport bridging. The <code class="literal">zmq_proxy()</code> method has three arguments: a <span class="emphasis"><em>frontend</em></span> and <span class="emphasis"><em>backend</em></span> socket that it bridges together, and a <span class="emphasis"><em>capture</em></span> socket to which it will send all messages.</p><p>The code is deceptively simple:</p><div class="example"><a id="espresso-c"></a><p class="title"><strong>Example 5.1. Espresso Pattern (espresso.c)</strong></p><div class="example-contents"><pre class="programlisting">
+//  Espresso Pattern
+//  This shows how to capture data using a pub-sub proxy
+
+#include "czmq.h"
+
+//  The subscriber thread requests messages starting with
+//  A and B, then reads and counts incoming messages.
+
+static void
+subscriber_thread (void *args, zctx_t *ctx, void *pipe)
+{
+    //  Subscribe to "A" and "B"
+    void *subscriber = zsocket_new (ctx, ZMQ_SUB);
+    zsocket_connect (subscriber, "tcp://localhost:6001");
+    zsocket_set_subscribe (subscriber, "A");
+    zsocket_set_subscribe (subscriber, "B");
+
+    int count = 0;
+    while (count &lt; 5) {
+        char *string = zstr_recv (subscriber);
+        if (!string)
+            break;              //  Interrupted
+        free (string);
+        count++;
+    }
+    zsocket_destroy (ctx, subscriber);
+}
+</pre></div></div><br class="example-break" /><p>The publisher sends random messages starting with A-J: 
+</p><div class="example"><a id="espresso-c-1"></a><p class="title"><strong>Example 5.2. Espresso Pattern (espresso.c) - publisher thread</strong></p><div class="example-contents"><pre class="programlisting">
+
+static void
+publisher_thread (void *args, zctx_t *ctx, void *pipe)
+{
+    void *publisher = zsocket_new (ctx, ZMQ_PUB);
+    zsocket_bind (publisher, "tcp://*:6000");
+
+    while (!zctx_interrupted) {
+        char string [10];
+        sprintf (string, "%c-%05d", randof (10) + 'A', randof (100000));
+        if (zstr_send (publisher, string) == -1)
+            break;              //  Interrupted
+        zclock_sleep (100);     //  Wait for 1/10th second
+    }
+}
+</pre></div></div><br class="example-break" /><p>The listener receives all messages flowing through the proxy, on its pipe. In CZMQ, the pipe is a pair of ZMQ_PAIR sockets that connect attached child threads. In other languages your mileage may vary: 
+</p><div class="example"><a id="espresso-c-2"></a><p class="title"><strong>Example 5.3. Espresso Pattern (espresso.c) - listener thread</strong></p><div class="example-contents"><pre class="programlisting">
+
+static void
+listener_thread (void *args, zctx_t *ctx, void *pipe)
+{
+    //  Print everything that arrives on pipe
+    while (true) {
+        zframe_t *frame = zframe_recv (pipe);
+        if (!frame)
+            break;              //  Interrupted
+        zframe_print (frame, NULL);
+        zframe_destroy (&amp;frame);
+    }
+}
+</pre></div></div><br class="example-break" /><p>The main task starts the subscriber and publisher, and then sets itself up as a listening proxy. The listener runs as a child thread: 
+</p><div class="example"><a id="espresso-c-3"></a><p class="title"><strong>Example 5.4. Espresso Pattern (espresso.c) - main thread</strong></p><div class="example-contents"><pre class="programlisting">
+
+int main (void)
+{
+    //  Start child threads
+    zctx_t *ctx = zctx_new ();
+    zthread_fork (ctx, publisher_thread, NULL);
+    zthread_fork (ctx, subscriber_thread, NULL);
+
+    void *subscriber = zsocket_new (ctx, ZMQ_XSUB);
+    zsocket_connect (subscriber, "tcp://localhost:6000");
+    void *publisher = zsocket_new (ctx, ZMQ_XPUB);
+    zsocket_bind (publisher, "tcp://*:6001");
+    void *listener = zthread_fork (ctx, listener_thread, NULL);
+    zmq_proxy (subscriber, publisher, listener);
+
+    puts (" interrupted");
+    //  Tell attached threads to exit
+    zctx_destroy (&amp;ctx);
+    return 0;
+}
+</pre></div></div><br class="example-break" /><p>Espresso works by creating a listener thread that reads a PAIR socket and prints anything it gets. That PAIR socket is one end of a pipe; the other end (another PAIR) is the socket we pass to <code class="literal">zmq_proxy()</code>. In practice, you'd filter interesting messages to get the essence of what you want to track (hence the name of the pattern).</p><p>The subscriber thread subscribes to "A" and "B", receives five messages, and then destroys its socket. When you run the example, the listener prints two subscription messages, five data messages, two unsubscribe messages, and then silence:</p><pre class="screen">[002] 0141
+[002] 0142
+[007] B-91164
+[007] B-12979
+[007] A-52599
+[007] A-06417
+[007] A-45770
+[002] 0041
+[002] 0042
+</pre><p>This shows neatly how the publisher socket stops sending data when there are no subscribers for it. The publisher thread is still sending messages. The socket just drops them silently.</p></div><div class="navfooter"><hr /><table width="100%" summary="Navigation footer"><tr><td width="40%" align="left"><a accesskey="p" href="ch05.html">Prev</a> </td><td width="20%" align="center"><a accesskey="u" href="ch05.html">Up</a></td><td width="40%" align="right"> <a accesskey="n" href="ch05s03.html">Next</a></td></tr><tr><td width="40%" align="left" valign="top">Chapter 5. Advanced Pub-Sub Patterns </td><td width="20%" align="center"><a accesskey="h" href="index.html">Home</a></td><td width="40%" align="right" valign="top"> Last Value Caching</td></tr></table></div></body></html>
