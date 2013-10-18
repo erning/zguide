@@ -1,0 +1,38 @@
+#! /bin/bash
+
+BOOK=zguide
+
+function mkone {
+    export BOOK_LANG=$1
+    export BOOK_FORM=pdf
+    bin/mkdocbook \
+        $3/preface_web.txt \
+        $3/chapter1.txt \
+        $3/chapter2.txt \
+        $3/chapter3.txt \
+        $3/chapter4.txt \
+        $3/chapter5.txt \
+        $3/chapter6.txt \
+        $3/chapter7.txt \
+        $3/chapter8.txt \
+        $3/postface.txt
+
+    sed -i 's/\.eps" format="EPS" width="4\.8in"/.png"/g' book.xml
+    rm -rf html/
+    mkdir -p html/images
+    cp images/*.png html/images
+    xmlto -o html xhtml book.xml
+
+#    export SP_CHARSET_FIXED=YES
+#    export SP_ENCODING=XML
+#    docbook2html -u book.xml
+#    docbook2html -o html book.xml
+
+#    mv book.pdf $BOOK-$2.$3.pdf
+}
+
+mkone C         c   zh
+# mkone Haxe      H   zh
+# mkone Lua       lua zh
+# mkone Python    py  zh
+# mkone PHP       php zh
